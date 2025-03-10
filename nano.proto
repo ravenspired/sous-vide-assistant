@@ -1,0 +1,166 @@
+// This defines protocol for the Anova Nano sous vide cooker.
+//
+// See also the nanopb-specific options in purdue.options.
+
+syntax = "proto2";
+
+enum DomainType {
+    ANOVA_DOMAIN_ID_CONFIG = 0;
+    ANOVA_DOMAIN_ID_BULK_TRANSFER = 1;
+    ANOVA_DOMAIN_ID_COUNT = 2;
+}
+
+enum BulkDomainMessageType{
+  MSG_TYPE_PAGE_GET =0;        // read a page
+  MSG_TYPE_PAGE_PUT = 1;       // write to a page
+  MSG_TYPE_FILE_ERASE =2;      // erase a page
+  MSG_TYPE_FILE_PROPS =3;      // read the file state (FIXME JS implement-me)
+  MSG_TYPE_SYSTEM_RESET =4;    // reset the system
+  MSG_TYPE_COUNT =5;
+}
+
+enum UnitType {
+  DEGREES_POINT_1C  = 0; // .1 Degree Celsius
+  DEGREES_POINT_1F  = 1; // .1 Degree Fahrenheit
+  MOTOR_SPEED       = 2; // motor speed (actual units very with motor)
+  BOOLEAN           = 3; // (value==0)? False : True
+  DEGREES_POINT_01C = 4; // .01 Degree Celsius
+  DEGREES_POINT_01F = 5; // .01 Degree Fahrenheit
+  DEGREES_C         = 6; // Celsius
+  DEGREES_F         = 7; // Fahrenheit
+}
+
+enum MessageError {
+  MSG_ERR_NONE =0 ;             /**< no error */
+  MSG_ERR_FAILED = 1;          /**< unclassified failure */
+  MSG_ERR_RESOURCE_IN_USE =2; /**< a needed resource was in use by another entity */
+  MSG_ERR_RX_OVERRUN =3;       /**< the receiver buffer overran */
+  MSG_ERR_TX_OVERRUN =4;       /**< the transmitter buffer  overran */
+  MSG_ERR_UNKNOWN_COMMAND = 5;   /**< unknown command */
+  MSG_ERR_LENGTH =6;          /**< length error */
+  MSG_ERR_RESOURCE_INVALID = 7; /**< resource invalid */
+  MSG_ERR_OP_UNSUPPORTED = 8;  /**< operation unsupported */
+}
+
+enum ConfigDomainMessageType{
+  LOOPBACK = 0; // 0
+  CLI_TEXT = 1; //1
+  SAY_HELLO = 2; // 2
+  SET_TEMP_SETPOINT = 3; // 0
+  GET_TEMP_SETPOINT = 4; // 0
+  GET_SENSORS  = 5;// 0
+  SET_TEMP_UNITS = 6;  // 0
+  GET_TEMP_UNITS = 7; // 0
+  SET_COOKING_POWER_LEVEL= 8; // 8
+  GET_COOKING_POWER_LEVEL = 9; //9
+  START_COOKING = 10; // 0
+  STOP_COOKING = 11; // 0
+  SET_SOUND_LEVEL = 12; // 4
+  GET_SOUND_LEVEL = 13; // 4
+  SET_DISPLAY_BRIGHTNESS = 14; // 4
+  GET_DISPLAY_BRIGHTNESS = 15; // 4
+  SET_COOKING_TIMER = 16; // 2
+  STOP_COOKING_TIMER = 17;
+  GET_COOKING_TIMER = 18; // 2
+  CANCEL_COOKING_TIMER = 19; // 2
+  SET_CHANGE_POINT = 20;
+  CHANGE_POINT = 22;
+  SET_BLE_PARAMS  = 23; // 3
+  BLE_PARAMS = 24; // 3
+  GET_DEVICE_INFO = 25; // 3
+  GET_FIRMWARE_INFO = 26; // 1
+  SYSTEM_ALERT_VECTOR  = 27; // 2
+  RESERVED28 = 28;
+  MESSAGE_SPOOF = 29;
+}
+
+enum TransferStatusError {
+   TR_STATUS_OK = 0;
+   TR_STATUS_PAGE_INVALID = 1;
+   TR_STATUS_PAGE_IN_USE = 2;
+   TR_STATUS_PAGE_CORRUPT = 3;
+   TR_STATUS_INVALID_FILE_HANDLE = 4;
+   TR_STATUS_FAILED = 5;
+}
+
+enum FileHandleType {
+   FILE_HANDLE_PSUDO = 0;
+   FILE_HANDLE_LOG = 1;
+   FILE_HANDLE_OTA = 2;
+}
+
+message IntegerValue {
+  required int32 value = 1;
+}
+
+message SensorValue{
+    enum SensorType{
+        WaterTemp = 0;
+        HeaterTemp = 1;
+        TriacTemp = 2;
+        UnusedTemp= 3;
+        InternalTemp= 4;
+        WaterLow = 5;
+        WaterLeak = 6;
+        MotorSpeed = 7;
+    }
+    required int32 value = 1;
+    required UnitType units = 2;
+    required SensorType sensorType = 3;
+}
+
+message SensorValueList  {
+     repeated SensorValue values = 1;
+}
+
+message SysAlertBitVector{
+enum Flag {
+  RESERVED0= 0;
+  HEATING_RATE_UPDATED = 1;
+  COOKING_STARTED = 2;
+  SET_POINT_REACHED = 4;
+  EVENT_LOG_FULL = 8;
+  WATER_LEAK = 16;
+  WATER_LOW = 32;
+  MOTOR_STUCK = 64;
+  HEATER_OVER_TEMP = 128;
+  TRIAC_OVER_TEMP = 256;
+  COOKING_TIMER_STARTED = 512;
+  SETPOINT_CHANGED = 1024;
+  UNITS_CHANGED = 2048;
+  RESET = 4096;
+  COOKING_TIMER_EXPIRED = 8192;
+  DELTA_TEMP = 16384;
+}
+
+    required uint32 prevSetVector = 1;
+    required uint32 currVector = 2;
+}
+
+message BleConnectionParams{
+    required uint32 slaveLatencyMs = 1;
+    required uint32 connectionIntervalMinMs = 2;
+    required uint32 connectionIntervalMaxMs = 3;
+}
+
+message DeviceInfo{
+    required uint32 revision = 1;
+    required uint32 modelNumber = 2;
+    required uint32 boardRevision = 3;
+    required uint32 bom= 4;
+    required uint32 platform= 5;
+    required uint32 cmCode= 6;
+    required uint32 dateCode =7;
+    required string serialNumber= 8;
+}
+
+message FirmwareInfo{
+    required string commitId= 1;
+    required string tagId= 2;
+    required uint32 dateCode= 3;
+}
+
+message DeviceState {
+    required SensorValue waterTemp = 1;
+    required SysAlertBitVector alerts = 2;
+}
