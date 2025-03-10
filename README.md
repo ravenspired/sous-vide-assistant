@@ -1,6 +1,6 @@
 # Anova Precision Nano BTLE Interface
 
-A complete Bluetooth Low Energy (BTLE) interface for the Anova Nano Sous Vide device. This module provides automated device discovery, connection management, and an interactive command interface to control and monitor your Anova Nano.
+A complete Bluetooth Low Energy (BTLE) interface for the Anova Precision® Cooker Nano sous vide cooker. This module provides automated device discovery, connection management, and an interactive command interface to control and monitor your Anova Precision® Cooker Nano.
 
 ## Features
 
