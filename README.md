@@ -24,8 +24,8 @@ A complete Bluetooth Low Energy (BTLE) interface for the Anova Precision® Cooke
 
 2. **Clone/Download the Repository:**
    ```bash
-   git clone https://github.com/yourusername/anova-nano.git
-   cd anova-nano
+   git clone https://github.com/yourusername/developer-project-nano.git
+   cd developer-project-nano
    ```
 
 ## Usage
@@ -35,7 +35,7 @@ A complete Bluetooth Low Energy (BTLE) interface for the Anova Precision® Cooke
 Run the module directly to start the interactive command loop:
 
 ```bash
-python anova_nano.py
+python nano-interactive.py
 ```
 
 Available commands:
