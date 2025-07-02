@@ -1,6 +1,10 @@
+<img src="https://developer.anovaculinary.com/img/logo.svg" alt="Anova Developers" width="350"/>
+
 # Anova Precision® Cooker Nano BTLE Interface
 
 A complete Bluetooth Low Energy (BTLE) interface for the Anova Precision® Cooker Nano sous vide cooker. This module provides automated device discovery, connection management, and an interactive command interface to control and monitor your Anova Precision® Cooker Nano.
+
+<img src="https://developer.anovaculinary.com/img/Anova_Precision_Cooker_Nano.jpg" alt="Anova Precision® Cooker Nano" width="271"/>
 
 ## Features
 
