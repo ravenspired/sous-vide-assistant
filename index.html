@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Sous Vide</title>
+<style>
+:root{
+  --bg:#0a1017;--panel:#121b26;--panel2:#192636;--line:#25364a;--text:#e9eff6;--dim:#8ea3b9;
+  --accent:#3aa7ff;--accent2:#1c6fb8;--hot:#ff8a4c;--ok:#35d07f;--warn:#ffc53d;--bad:#ff5d5d;
+  --r:1rem;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{font-size:min(2.1vh,1.18vw)}
+@media (max-width:820px){html{font-size:14px}}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,sans-serif;
+  height:100vh;height:100dvh;overflow:hidden;user-select:none;-webkit-user-select:none}
+button{font:inherit;color:inherit;border:0;cursor:pointer;touch-action:manipulation}
+#app{display:flex;flex-direction:column;height:100%;padding:.8rem 1rem 1rem;gap:.7rem}
+header{display:flex;align-items:center;gap:1rem;min-height:2.6rem}
+header h1{font-size:1.25rem;margin:0;font-weight:700;letter-spacing:.01em}
+.spacer{flex:1}
+.pill{display:flex;align-items:center;gap:.5rem;background:var(--panel);border:1px solid var(--line);padding:.35rem .9rem;border-radius:2rem;font-size:.9rem;color:var(--dim);white-space:nowrap}
+.dot{width:.65rem;height:.65rem;border-radius:50%;background:#556;flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn);animation:blink 1s infinite}.dot.bad{background:var(--bad)}
+@keyframes blink{50%{opacity:.25}}
+#clock{font-variant-numeric:tabular-nums;color:var(--dim);font-size:1rem}
+#snd{display:none;cursor:pointer;color:var(--warn)}
+#banner{display:flex;flex-direction:column;gap:.5rem}
+.banner{padding:.7rem 1.1rem;border-radius:.8rem;font-weight:600;font-size:1.05rem;display:flex;align-items:center;gap:.7rem}
+.banner.bad{background:#5a1c1f;border:1px solid var(--bad);animation:blink 1.2s infinite}
+.banner.warn{background:#4a3a10;border:1px solid var(--warn)}
+main{flex:1;min-height:0;display:flex;flex-direction:column;gap:.8rem}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:1rem 1.2rem;min-width:0}
+.label{color:var(--dim);font-size:.85rem;text-transform:uppercase;letter-spacing:.08em}
+.btn{background:var(--panel2);border:1px solid var(--line);border-radius:.9rem;padding:.9rem 1.5rem;font-size:1.1rem;font-weight:600;min-width:7rem}
+.btn:active{filter:brightness(1.3)}
+.btn.primary{background:var(--accent2);border-color:var(--accent)}
+.btn.go{background:#1b7f4d;border-color:var(--ok)}
+.btn.warn{background:#7a3d12;border-color:var(--hot)}
+.btn.danger{background:#6a1f24;border-color:var(--bad)}
+.btn.big{font-size:1.3rem;padding:1.1rem 2rem}
+.btn[disabled]{opacity:.35;pointer-events:none}
+.actions{display:flex;gap:.8rem;justify-content:center;flex:none}
+.actions .btn{flex:1;max-width:20rem}
+
+/* home */
+.home{flex:1;min-height:0;display:flex;flex-direction:column;gap:.8rem}
+.grid{flex:1;min-height:0;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(3,1fr);gap:.8rem}
+@media (max-width:820px){.grid{grid-template-columns:repeat(2,1fr);grid-template-rows:none;grid-auto-rows:7rem;overflow:auto}}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.25rem;padding:.5rem;min-height:0}
+.tile:active{background:var(--panel2);border-color:var(--accent)}
+.tile .em{font-size:2.6rem;line-height:1}
+.tile b{font-size:1.2rem}
+.tile small{color:var(--dim);font-size:.9rem}
+.tile.blank{border-style:dashed;background:transparent;color:var(--dim)}
+.homebar{display:flex;gap:.8rem;flex:none}
+.homebar .btn{flex:1}.homebar .btn.big{flex:3}
+
+/* setup */
+.setup{flex:1;min-height:0;display:flex;flex-direction:column;gap:.8rem}
+.srow{display:flex;gap:.8rem;flex:none}
+.pots{display:flex;gap:.8rem}
+.pot{flex:1;background:var(--panel);border:2px solid var(--line);border-radius:var(--r);padding:1rem;display:flex;flex-direction:column;align-items:center;gap:.2rem}
+.pot b{font-size:1.6rem}.pot span{color:var(--dim)}.pot em{font-style:normal;color:var(--accent);font-weight:600}
+.pot.sel{border-color:var(--accent);background:#10304a}
+.toggle{display:flex;align-items:center;gap:1rem;font-size:1.2rem;font-weight:600}
+.sw{width:4.2rem;height:2.3rem;border-radius:2rem;background:#2a3a4d;position:relative;transition:.15s;flex:none}
+.sw::after{content:"";position:absolute;top:.25rem;left:.25rem;width:1.8rem;height:1.8rem;border-radius:50%;background:#fff;transition:.15s}
+.sw.on{background:var(--accent2)}.sw.on::after{left:2.1rem}
+.sum{display:flex;gap:1.2rem;flex:1;min-height:0}
+.sum .card{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:.3rem}
+.sum .v{font-size:2.8rem;font-weight:700;font-variant-numeric:tabular-nums}.sum .v small{font-size:1.2rem;color:var(--dim);font-weight:500}
+.sum .n{color:var(--dim);font-size:.9rem}
+
+/* manual */
+.manual{flex:1;min-height:0;display:flex;gap:1rem}
+.manual .left{flex:1.1;display:flex;flex-direction:column;gap:.8rem;min-width:0}
+.fld{background:var(--panel);border:2px solid var(--line);border-radius:var(--r);padding:.7rem 1.2rem;display:flex;align-items:center;justify-content:space-between;text-align:left;width:100%}
+.fld.sel{border-color:var(--accent);background:#10304a}
+.fld .fl{color:var(--dim)}.fld .fv{font-size:2.4rem;font-weight:700;font-variant-numeric:tabular-nums}.fld .fv small{font-size:1.1rem;color:var(--dim);font-weight:500}
+.fld .fv.ph{color:#4b5d72}
+.fld .hint{display:block;color:var(--dim);font-size:.85rem}
+.padbox{flex:.9;display:flex;flex-direction:column;gap:.8rem;min-width:0}
+.keys{display:grid;grid-template-columns:repeat(3,1fr);gap:.6rem;flex:1;min-height:0}
+.keys button{background:var(--panel2);border:1px solid var(--line);border-radius:.9rem;font-size:1.8rem;font-weight:600;min-height:3.2rem}
+.keys button:active{background:var(--accent2)}
+.keys button.sub{font-size:1.3rem;color:var(--dim)}
+
+/* modals */
+#modal,#pad,#confirm{position:fixed;inset:0;background:rgba(3,7,12,.8);display:none;align-items:center;justify-content:center;z-index:20}
+#pad{z-index:30}#confirm{z-index:40}
+.show{display:flex!important}
+.sheet{background:var(--panel);border:1px solid var(--line);border-radius:1.2rem;padding:1.2rem;max-height:94vh;overflow:auto;display:flex;flex-direction:column;gap:.8rem}
+.sheet.pad{width:min(26rem,92vw)}
+.sheet.ed{width:min(52rem,94vw)}
+.sheet.cf{width:min(28rem,92vw);text-align:center}
+.pdisp{font-size:3rem;font-weight:700;text-align:center;background:var(--bg);border-radius:.8rem;padding:.5rem;font-variant-numeric:tabular-nums}
+.pdisp small{font-size:1.2rem;color:var(--dim);margin-left:.4rem}
+.pdisp i{display:block;font-style:normal;font-size:.9rem;color:var(--dim);font-weight:400}
+.prow{display:flex;gap:.6rem}.prow .btn{flex:1;min-width:0;padding:.8rem .5rem}
+.sheet h3{margin:0;font-size:1.3rem}
+.edgrid{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
+.edgrid label{display:flex;flex-direction:column;gap:.3rem;color:var(--dim);font-size:.85rem;text-transform:uppercase;letter-spacing:.06em}
+.edgrid input[type=text]{background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:.7rem;padding:.7rem .9rem;font-size:1.2rem;user-select:text;-webkit-user-select:text}
+.nb{background:var(--bg);border:1px solid var(--line);border-radius:.7rem;padding:.7rem .9rem;font-size:1.2rem;text-align:left;color:var(--text);font-weight:600}
+.nb.auto{color:var(--dim);font-weight:400}
+.emojis{display:flex;flex-wrap:wrap;gap:.4rem}
+.emojis button{background:var(--bg);border:1px solid var(--line);border-radius:.6rem;font-size:1.5rem;width:2.8rem;height:2.8rem}
+
+/* settings */
+.settings{flex:1;min-height:0;display:flex;flex-direction:column;gap:.8rem}
+.tabs{display:flex;gap:.6rem;flex:none}
+.tabs .btn{flex:1;padding:.7rem}.tabs .btn.on{background:var(--accent2);border-color:var(--accent)}
+.sbody{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:.7rem}
+.slots{display:grid;grid-template-columns:repeat(3,1fr);gap:.7rem}
+.slot{background:var(--panel);border:1px solid var(--line);border-radius:.9rem;padding:.7rem .9rem;display:flex;align-items:center;gap:.8rem;text-align:left}
+.slot .em{font-size:2rem}.slot b{display:block}.slot small{color:var(--dim)}
+.slot.blank{border-style:dashed;color:var(--dim)}
+.setrow{display:flex;align-items:center;gap:1rem;background:var(--panel);border:1px solid var(--line);border-radius:.9rem;padding:.7rem 1.1rem}
+.setrow .t{flex:1}.setrow .t small{display:block;color:var(--dim);font-size:.85rem}
+.setrow .nb{min-width:8rem;text-align:center}
+.setrow input[type=text]{background:var(--bg);border:1px solid var(--line);color:var(--text);border-radius:.7rem;padding:.6rem .8rem;font-size:1.1rem;width:8rem;user-select:text;-webkit-user-select:text}
+.setrow input[type=range]{width:14rem}
+
+/* session */
+.center{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.8rem;text-align:center}
+.huge{font-size:7rem;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}.huge small{font-size:2.5rem;color:var(--dim);font-weight:600;margin-left:.4rem}
+.instr{font-size:1.8rem;font-weight:600}.sub{color:var(--dim);font-size:1.15rem}
+.drop{font-size:4rem}
+.pulse{animation:pulse 1.4s infinite}@keyframes pulse{50%{transform:scale(1.12);opacity:.7}}
+.ok{color:var(--ok)}.hot{color:var(--hot)}.bad{color:var(--bad)}.warnc{color:var(--warn)}
+.two{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1.3fr;gap:.8rem}
+.hero{display:flex;flex-direction:column;justify-content:center;align-items:center;gap:.5rem;text-align:center}
+.bigtemp{font-size:6.5rem;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.bigtemp small{font-size:2.2rem;color:var(--dim);font-weight:600}
+.bar{height:1rem;border-radius:1rem;background:#1c2a3b;overflow:hidden;width:100%}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--hot));border-radius:1rem;transition:width .6s}
+.eta{font-size:2.4rem;font-weight:700}.tag{font-size:.8rem;color:var(--dim);border:1px solid var(--line);border-radius:1rem;padding:.15rem .7rem;margin-left:.6rem;vertical-align:middle;font-weight:500}
+.chartcard{position:relative;padding:.6rem;min-height:8rem;flex:1}
+.chartcard canvas{position:absolute;left:.6rem;top:.6rem;width:calc(100% - 1.2rem);height:calc(100% - 1.2rem)}
+.cookgrid{flex:1;min-height:0;display:grid;grid-template-columns:.9fr 1.6fr;gap:.8rem}
+.cookgrid .col{display:flex;flex-direction:column;gap:.8rem;min-height:0;min-width:0}
+.ringwrap{position:relative;width:min(100%,40vh);aspect-ratio:1}
+.ringwrap svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ringwrap .rbg{fill:none;stroke:#1c2a3b;stroke-width:9}
+.ringwrap .rfg{fill:none;stroke:var(--accent);stroke-width:9;stroke-linecap:round;transition:stroke-dashoffset .8s}
+.ringwrap.done .rfg{stroke:var(--ok)}
+.ringtxt{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ringtxt b{font-size:2.6rem;font-variant-numeric:tabular-nums;line-height:1.05}
+.ringtxt span{color:var(--dim);font-size:.9rem;text-transform:uppercase;letter-spacing:.08em}
+.stats{display:flex;gap:.8rem;flex:none}
+.stat{flex:1;text-align:center;padding:.6rem}
+.stat b{display:block;font-size:2.4rem;font-variant-numeric:tabular-nums}.stat small{font-size:1rem;color:var(--dim)}
+.dipbox{display:flex;gap:1rem;align-items:center;flex:none;min-height:7.5rem;padding:.7rem 1rem}
+.dipbox .dtxt{flex:1.2;min-width:0}.dipbox .dtxt b{font-size:1.15rem}.dipbox .dtxt div{color:var(--dim);margin-top:.2rem;line-height:1.35}
+.dipbox canvas{flex:1 1 0;width:0;height:6.2rem;min-width:0}
+.pausedtag{background:#4a3a10;border:1px solid var(--warn);color:var(--warn);border-radius:.7rem;padding:.3rem .9rem;font-weight:700;letter-spacing:.06em}
+.otbig{font-size:3.4rem;font-weight:800;color:var(--ok);font-variant-numeric:tabular-nums}
+.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:.8rem;width:100%}
+#toast{position:fixed;bottom:1.2rem;left:50%;transform:translateX(-50%);background:#5a1c1f;border:1px solid var(--bad);padding:.8rem 1.4rem;border-radius:.8rem;z-index:50;display:none;max-width:90vw}
+#simbar{position:fixed;left:11rem;top:.35rem;display:none;gap:.4rem;z-index:15;background:#000a;padding:.25rem .4rem;border-radius:.8rem;border:1px dashed var(--warn)}
+#simbar button{background:var(--panel2);border-radius:.6rem;padding:.4rem .7rem;font-size:.85rem;border:1px solid var(--line)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🍳 Sous Vide</h1>
+    <span class="spacer"></span>
+    <span id="snd" class="pill" data-act="snd">🔇 Tap to enable sound</span>
+    <div class="pill" id="connpill"><span class="dot" id="conndot"></span><span id="conntxt">Cooker idle</span></div>
+    <span id="clock"></span>
+  </header>
+  <div id="banner"></div>
+  <main id="main"></main>
+</div>
+<div id="modal"></div><div id="pad"></div><div id="confirm"></div>
+<div id="toast"></div>
+<div id="simbar">
+  <button data-act="sim" data-n="food">🥩 Drop food in</button>
+  <button data-act="sim" data-n="lowwater">💧 Low water</button>
+  <button data-act="sim" data-n="refill">✅ Refilled</button>
+  <button data-act="sim" data-n="unplug">🔌 Unplug</button>
+</div>
+
+<script>
+'use strict';
+/* ------------------------------------------------------------------ helpers */
+const $ = (s, e = document) => e.querySelector(s);
+const pad2 = n => String(n).padStart(2, '0');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hms = s => { s = Math.max(0, Math.floor(s)); const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60; return h ? `${h}:${pad2(m)}:${pad2(x)}` : `${m}:${pad2(x)}`; };
+const dur = min => { min = Math.round(min); const h = Math.floor(min/60), m = min%60; return h ? (m ? `${h}h ${m}m` : `${h}h`) : `${m}m`; };
+const t1 = x => x == null ? '--.-' : Number(x).toFixed(1);
+const fmtL = x => { const r = Math.round(x*100)/100; return (Math.round(r*10) === r*10) ? r.toFixed(1) : r.toFixed(2); };
+const cssv = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const setText = (id, v) => { const e = document.getElementById(id); if (e && e.textContent !== String(v)) e.textContent = v; };
+const setHTML = (id, v) => { const e = document.getElementById(id); if (e && e.innerHTML !== v) e.innerHTML = v; };
+
+async function api(path, method = 'GET', body) {
+  const r = await fetch(path, {method, headers: {'Content-Type': 'application/json'}, body: body ? JSON.stringify(body) : undefined});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+let toastT;
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(() => t.style.display = 'none', 4500); }
+
+/* -------------------------------------------------------------------- sound */
+const Au = {
+  ctx: null, vol: .7,
+  async unlock() {
+    try {
+      if (!this.ctx) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return; this.ctx = new C(); }
+      if (this.ctx.state !== 'running') await this.ctx.resume();
+    } catch (e) {}
+  },
+  tone(f, t, d, g) {
+    const c = this.ctx, o = c.createOscillator(), o2 = c.createOscillator(), gn = c.createGain(), g2 = c.createGain();
+    o.type = 'sine'; o2.type = 'sine'; o.frequency.value = f; o2.frequency.value = f * 2.76; g2.gain.value = .25;
+    gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(Math.max(.001, g * this.vol), t + .012);
+    gn.gain.exponentialRampToValueAtTime(.0001, t + d);
+    o.connect(gn); o2.connect(g2); g2.connect(gn); gn.connect(c.destination);
+    o.start(t); o2.start(t); o.stop(t + d + .05); o2.stop(t + d + .05);
+  },
+  play(type) {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    const t0 = this.ctx.currentTime + .05;
+    const jingle = [[523.25,0],[659.25,.2],[783.99,.4],[1046.5,.6],[783.99,.95],[1046.5,1.15]];
+    const P = {
+      ready: [[659.25,0],[783.99,.18],[987.77,.36],[1318.51,.54],[659.25,1.4],[783.99,1.58],[987.77,1.76],[1318.51,1.94]],
+      cookstart: [[523.25,0],[783.99,.16]],
+      complete: [0, 2.4, 4.8].flatMap(o => jingle.map(([f, t]) => [f, t + o])),
+      lowwater: [[880,0],[660,.16],[880,.32],[660,.48],[880,.64],[660,.8]],
+      lost: [[330,0],[247,.3],[330,.9],[247,1.2]],
+    }[type];
+    if (!P) return;
+    P.forEach(([f, t]) => this.tone(f, t0 + t, type === 'lowwater' ? .5 : 1.3, type === 'lowwater' ? 1.1 : .8));
+  },
+};
+document.addEventListener('pointerdown', () => Au.unlock(), {passive: true});
+document.addEventListener('keydown', () => Au.unlock());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { Au.unlock(); wake(); } });
+let wl = null;
+async function wake() { try { if (navigator.wakeLock && ST && ST.session && !wl) { wl = await navigator.wakeLock.request('screen'); wl.addEventListener('release', () => wl = null); } } catch (e) {} }
+
+/* ------------------------------------------------------------------- charts */
+function drawChart(cv, pts, o = {}) {
+  if (!cv || !cv.getContext) return;
+  const c = cv.getContext('2d'); if (!c) return;
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight; if (!W || !H) return;
+  if (cv.width !== Math.round(W*dpr) || cv.height !== Math.round(H*dpr)) { cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr); }
+  c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, W, H);
+  const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+  const fs = Math.max(10, Math.round(rootPx * (o.mini ? .7 : .85)));
+  c.font = `${fs}px system-ui,sans-serif`;
+  if (!pts || pts.length < 2) { c.fillStyle = cssv('--dim'); c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('Collecting data…', W/2, H/2); return; }
+  let lo = Math.min(...pts.map(p => p[1])), hi = Math.max(...pts.map(p => p[1]));
+  if (o.target != null) { lo = Math.min(lo, o.target); hi = Math.max(hi, o.target); }
+  const padv = Math.max((hi - lo) * .12, .5); lo -= padv; hi += padv;
+  if (hi - lo < 2) { const m = (hi + lo) / 2; lo = m - 1; hi = m + 1; }
+  const L = fs * 2.8, R = 8, T = fs * (o.mini ? .6 : 1.4), B = o.mini ? 4 : fs * 1.7;
+  const x0 = pts[0][0], x1 = pts[pts.length-1][0], span = Math.max(1, x1 - x0);
+  const X = t => L + (t - x0) / span * (W - L - R), Y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  c.lineWidth = 1; c.strokeStyle = cssv('--line'); c.fillStyle = cssv('--dim'); c.textAlign = 'right'; c.textBaseline = 'middle';
+  const gl = o.mini ? 2 : 3;
+  for (let i = 0; i <= gl; i++) { const v = lo + (hi - lo) * i / gl, y = Y(v); c.beginPath(); c.moveTo(L, y); c.lineTo(W - R, y); c.stroke(); c.fillText(v.toFixed(1), L - 6, y); }
+  if (o.target != null) {
+    c.save(); c.setLineDash([6, 5]); c.strokeStyle = cssv('--ok'); c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(L, Y(o.target)); c.lineTo(W - R, Y(o.target)); c.stroke(); c.restore();
+  }
+  const names = {start: 'Start', ready: 'Ready', food: 'Food in', recovered: 'Recovered', done: 'Done', end: 'End', armed: ''};
+  c.textAlign = 'left'; c.textBaseline = 'top'; let lastEnd = -1e9;
+  (o.marks || []).forEach(m => {
+    if (!names[m.k] || m.t < x0 || m.t > x1) return;
+    const x = X(m.t); c.save(); c.setLineDash([3, 4]); c.strokeStyle = cssv('--dim'); c.beginPath(); c.moveTo(x, T); c.lineTo(x, H - B); c.stroke(); c.restore();
+    c.fillStyle = cssv('--dim'); const lw = c.measureText(names[m.k]).width, right = x + lw + 4 > W;
+    const x0l = right ? x - 4 - lw : x + 4; if (x0l < lastEnd + 6) return;
+    c.textAlign = 'left'; c.fillText(names[m.k], x0l, 2); lastEnd = x0l + lw;
+  });
+  c.beginPath(); pts.forEach((p, i) => i ? c.lineTo(X(p[0]), Y(p[1])) : c.moveTo(X(p[0]), Y(p[1])));
+  c.strokeStyle = cssv('--hot'); c.lineWidth = 2.5; c.lineJoin = 'round'; c.stroke();
+  const lp = pts[pts.length-1]; c.fillStyle = cssv('--hot'); c.beginPath(); c.arc(X(lp[0]), Y(lp[1]), 4, 0, 7); c.fill();
+  if (!o.mini) { c.fillStyle = cssv('--dim'); c.textAlign = 'center'; c.textBaseline = 'bottom'; c.fillText(`last ${hms(span)}`, (L + W - R) / 2, H - 1); }
+}
+
+/* ---------------------------------------------------------------- app state */
+let ST = null, SET = null, view = 'home', setup = null, man = null, stab = 'foods', lastKey = '', seenEv = null, draft = null, draftIdx = null;
+let lastPot = localStorage.getItem('pot') || 'medium';
+
+const potOf = id => SET.pots.find(p => p.id === id) || SET.pots[1];
+const litersFor = (food, potId) => (food && food.liters && food.liters[potId]) || potOf(potId).liters;
+async function saveSettings() { SET = await api('/api/settings', 'PUT', SET); }
+function go(v) { view = v; lastKey = ''; render(); }
+
+/* ----------------------------------------------------------------- numpad */
+function applyKey(buf, k, mode) {
+  if (k === 'C') return '';
+  if (k === 'B') return buf.slice(0, -1);
+  if (k === '.') { if (mode !== 'dec' || buf.includes('.')) return buf; return (buf || '0') + '.'; }
+  if (mode === 'time') return (buf + k).replace(/^0+/, '').slice(0, 4);
+  if (mode === 'dec') { const [a, b] = (buf + k).split('.'); if (b !== undefined && b.length > 2) return buf; return (buf + k).replace(/^0+(\d)/, '$1').slice(0, 6); }
+  return (buf + k).replace(/^0+/, '').slice(0, 5);
+}
+const timeMin = b => { b = b || ''; return (parseInt(b.slice(0, -2) || '0', 10) * 60) + parseInt(b.slice(-2) || '0', 10); };
+function dispBuf(b, mode) {
+  if (mode === 'time') { const p = (b || '').padStart(3, '0'); return `${parseInt(p.slice(0, -2), 10)}:${p.slice(-2)}`; }
+  return b === '' ? '0' : b;
+}
+const keysHTML = (mode, att) => `<div class="keys">${'123456789'.split('').map(k => `<button ${att}="${k}">${k}</button>`).join('')}
+  ${mode === 'dec' ? `<button ${att}=".">.</button>` : `<button class="sub" ${att}="C">Clear</button>`}<button ${att}="0">0</button>
+  <button class="sub" ${att}="B">⌫</button></div>`;
+// value -> initial buffer
+const toBuf = (v, mode) => v == null ? '' : mode === 'time' ? String(Math.floor(v/60) * 100 + Math.round(v) % 60).replace(/^0+/, '') : String(v);
+const fromBuf = (b, mode) => mode === 'time' ? timeMin(b) : mode === 'dec' ? parseFloat(b || '0') : parseInt(b || '0', 10);
+
+function askNumber(o) {
+  return new Promise(resolve => {
+    let buf = toBuf(o.value, o.mode); const m = $('#pad');
+    const draw = () => {
+      m.innerHTML = `<div class="sheet pad"><div class="label">${esc(o.title)}</div>
+        <div class="pdisp">${esc(dispBuf(buf, o.mode))}<small>${esc(o.unit || '')}</small>${o.mode === 'time' ? `<i>${dur(timeMin(buf))}</i>` : ''}</div>
+        ${keysHTML(o.mode, 'data-k')}
+        <div class="prow"><button class="btn" data-k="cancel">Cancel</button>${o.clearLabel ? `<button class="btn" data-k="auto">${esc(o.clearLabel)}</button>` : ''}<button class="btn primary" data-k="ok">OK</button></div></div>`;
+    };
+    const done = v => { m.classList.remove('show'); m.onclick = null; m.innerHTML = ''; resolve(v); };
+    m.onclick = e => {
+      const b = e.target.closest('[data-k]'); if (!b) { if (e.target === m) done(null); return; }
+      const k = b.dataset.k;
+      if (k === 'cancel') return done(null);
+      if (k === 'auto') return done('auto');
+      if (k === 'ok') { const v = fromBuf(buf, o.mode); return done(isFinite(v) ? v : null); }
+      buf = applyKey(buf, k, o.mode); draw();
+    };
+    draw(); m.classList.add('show');
+  });
+}
+function confirmBox(msg, yes = 'Yes', cls = 'danger') {
+  return new Promise(resolve => {
+    const m = $('#confirm');
+    m.innerHTML = `<div class="sheet cf"><h3>${esc(msg)}</h3><div class="prow"><button class="btn" data-k="no">Cancel</button><button class="btn ${cls}" data-k="yes">${esc(yes)}</button></div></div>`;
+    m.onclick = e => { const b = e.target.closest('[data-k]'); if (!b) return; m.classList.remove('show'); m.onclick = null; resolve(b.dataset.k === 'yes'); };
+    m.classList.add('show');
+  });
+}
+
+/* -------------------------------------------------------------------- views */
+function homeHTML() {
+  const tiles = SET.foods.map((f, i) => f.name
+    ? `<button class="tile" data-act="pick" data-i="${i}"><span class="em">${esc(f.emoji || '🍽️')}</span><b>${esc(f.name)}</b><small>${t1(f.temp_c)}°C · ${dur(f.time_min)}</small></button>`
+    : `<button class="tile blank" data-act="edit" data-i="${i}"><span class="em">＋</span><small>Empty slot — tap to program</small></button>`).join('');
+  return `<div class="home"><div class="grid">${tiles}</div>
+    <div class="homebar"><button class="btn big primary" data-act="manual">🎛️ Manual cook</button><button class="btn big" data-act="settings">⚙️ Settings</button></div></div>`;
+}
+
+function potButtons(sel, food) {
+  return `<div class="pots">${SET.pots.map(p => `<button class="pot ${p.id === sel ? 'sel' : ''}" data-act="potsel" data-pot="${p.id}">
+    <b>${esc(p.label)}</b><span>${esc(p.range)}</span><em>${fmtL(food ? litersFor(food, p.id) : p.liters)} L</em></button>`).join('')}</div>`;
+}
+
+function setupHTML() {
+  const f = SET.foods[setup.i], pot = potOf(setup.pot);
+  const extra = setup.frozen ? f.frozen_extra_min : 0, total = f.time_min + extra;
+  return `<div class="setup">
+    <div class="srow" style="align-items:center"><span style="font-size:3rem">${esc(f.emoji)}</span><div><div style="font-size:2rem;font-weight:700">${esc(f.name)}</div><div class="sub">Pick the pot you're using</div></div></div>
+    ${potButtons(setup.pot, f)}
+    <div class="srow card" style="align-items:center;justify-content:space-between">
+      <button class="toggle" data-act="frozen" style="background:none"><span class="sw ${setup.frozen ? 'on' : ''}"></span>Start from frozen</button>
+      <span class="sub">${f.frozen_extra_min ? `adds ${dur(f.frozen_extra_min)}` : 'no extra time set for this food'}</span></div>
+    <div class="sum">
+      <div class="card"><div class="label">Temperature</div><div class="v">${t1(f.temp_c)}<small>°C</small></div></div>
+      <div class="card"><div class="label">Cook time</div><div class="v">${dur(total)}</div><div class="n">${setup.frozen && extra ? `${dur(f.time_min)} + ${dur(extra)} frozen` : '&nbsp;'}</div></div>
+      <div class="card"><div class="label">Water</div><div class="v">${fmtL(litersFor(f, pot.id))}<small>L</small></div><div class="n">${esc(pot.label)} pot</div></div>
+    </div>
+    <div class="actions"><button class="btn" data-act="back">← Back</button><button class="btn go big" data-act="startfood">Start cook →</button></div></div>`;
+}
+
+function manFieldHTML(key, label, val, unit, ph, hint) {
+  return `<button class="fld ${man.field === key ? 'sel' : ''}" data-act="mfield" data-f="${key}"><span><span class="fl">${label}</span>${hint ? `<span class="hint">${hint}</span>` : ''}</span>
+    <span class="fv ${val === '' ? 'ph' : ''}">${val === '' ? ph : esc(val)}<small>${unit}</small></span></button>`;
+}
+function manualHTML() {
+  const pot = potOf(man.pot), tmin = timeMin(man.time);
+  const timeVal = man.time === '' ? '' : dispBuf(man.time, 'time');
+  const litersVal = man.liters !== '' ? man.liters : fmtL(pot.liters);
+  return `<div class="manual"><div class="left">
+      ${potButtons(man.pot, null)}
+      ${manFieldHTML('temp', 'Temperature', man.temp, '°C', '— —', 'tap, then use the keypad')}
+      ${manFieldHTML('time', 'Time', timeVal, 'h:mm', '0:00', man.time === '' ? '' : `= ${dur(tmin)}`)}
+      ${manFieldHTML('liters', 'Water', litersVal, 'L', '', man.liters === '' ? 'default for this pot' : 'custom')}
+    </div><div class="padbox">${keysHTML(man.field === 'time' ? 'time' : 'dec', 'data-mk')}
+      <div class="actions"><button class="btn" data-act="back">← Back</button><button class="btn go big" data-act="mstart">Start →</button></div></div></div>`;
+}
+
+function settingsHTML() {
+  const tabs = [['foods', 'Foods'], ['pots', 'Pots & water'], ['cooker', 'Cooker & alerts']];
+  let body = '';
+  if (stab === 'foods') {
+    body = `<div class="slots">${SET.foods.map((f, i) => f.name
+      ? `<button class="slot" data-act="edit" data-i="${i}"><span class="em">${esc(f.emoji || '🍽️')}</span><span><b>${esc(f.name)}</b><small>${t1(f.temp_c)}°C · ${dur(f.time_min)} · frozen +${dur(f.frozen_extra_min)}</small></span></button>`
+      : `<button class="slot blank" data-act="edit" data-i="${i}"><span class="em">＋</span><span>Empty slot ${i + 1}</span></button>`).join('')}</div>`;
+  } else if (stab === 'pots') {
+    body = SET.pots.map((p, i) => `<div class="setrow"><div class="t"><b>Pot ${i + 1}</b><small>Default water for this pot (individual foods can override it)</small></div>
+      <input type="text" data-pl="${i}" value="${esc(p.label)}" maxlength="12" aria-label="label"><input type="text" data-pr="${i}" value="${esc(p.range)}" maxlength="16" aria-label="range">
+      <button class="nb" data-act="potl" data-i="${i}">${fmtL(p.liters)} L</button></div>`).join('');
+  } else {
+    const num = (key, t, sub, txt) => `<div class="setrow"><div class="t">${t}<small>${sub}</small></div><button class="nb" data-act="cfg" data-key="${key}">${txt}</button></div>`;
+    body = num('power_w', 'Cooker power', 'Used for the preheat estimate', `${SET.power_w} W`)
+      + num('efficiency', 'Heating efficiency', 'Share of power that actually warms the bath (the live estimate self-corrects anyway)', `${Math.round(SET.efficiency * 100)} %`)
+      + num('dip_threshold_c', 'Food-in detection', 'Temperature drop below target that means the food went in', `${SET.dip_threshold_c} °C`)
+      + num('ready_tol_c', 'At-temperature window', 'How close to target counts as "reached"', `${SET.ready_tol_c} °C`)
+      + num('ready_reminder_s', 'Bath-ready reminder', 'Repeat the chime until food goes in (0 = once)', `${SET.ready_reminder_s} s`)
+      + `<div class="setrow"><div class="t">Volume<small>Alarm and chime loudness</small></div><input type="range" min="0" max="1" step="0.05" value="${SET.volume}" id="vol"></div>
+         <div class="setrow"><div class="t">Test sounds</div><div class="prow"><button class="btn" data-act="snd" data-t="ready">Ready</button><button class="btn" data-act="snd" data-t="complete">Complete</button><button class="btn" data-act="snd" data-t="lowwater">Low water</button><button class="btn" data-act="snd" data-t="lost">Lost</button></div></div>`;
+  }
+  return `<div class="settings"><div class="tabs">${tabs.map(([k, n]) => `<button class="btn ${stab === k ? 'on' : ''}" data-act="stab" data-t="${k}">${n}</button>`).join('')}</div>
+    <div class="sbody">${body}</div><div class="actions"><button class="btn big" data-act="back">← Done</button></div></div>`;
+}
+
+/* ---- food editor */
+const EMOJI = ['🐔','🍗','🥩','🐷','🍖','🐄','🐑','🦆','🐟','🦐','🥚','🍳','🥕','🥔','🌽','🍆','🧀','🍠','🥦','🍑'];
+function editorHTML() {
+  const d = draft, nb = (f, txt, cls = '') => `<button class="nb ${cls}" data-act="ednum" data-f="${f}">${txt}</button>`;
+  const lit = id => { const v = d.liters[id], p = potOf(id); return v ? nb('l_' + id, `${fmtL(v)} L`) : nb('l_' + id, `Auto · ${fmtL(p.liters)} L`, 'auto'); };
+  return `<div class="sheet ed"><h3>Slot ${draftIdx + 1}</h3>
+    <div class="edgrid">
+      <label>Name<input type="text" id="edname" value="${esc(d.name)}" maxlength="24" placeholder="e.g. Lamb Chops"></label>
+      <label>Icon<input type="text" id="edemoji" value="${esc(d.emoji)}" maxlength="4"></label>
+      <div style="grid-column:1/-1" class="emojis">${EMOJI.map(e => `<button data-act="edemoji" data-e="${e}">${e}</button>`).join('')}</div>
+      <label>Temperature (°C)${nb('temp_c', `${t1(d.temp_c)} °C`)}</label>
+      <label>Cook time${nb('time_min', dur(d.time_min))}</label>
+      <label>Extra time when frozen${nb('frozen_extra_min', `+${dur(d.frozen_extra_min)}`)}</label>
+      <span></span>
+      ${SET.pots.map(p => `<label>Water · ${esc(p.label)} pot${lit(p.id)}</label>`).join('')}
+    </div>
+    <div class="prow"><button class="btn danger" data-act="edclear">Clear slot</button><button class="btn" data-act="edcancel">Cancel</button><button class="btn go" data-act="edsave">Save</button></div></div>`;
+}
+function openEditor(i) { draftIdx = i; draft = JSON.parse(JSON.stringify(SET.foods[i])); const m = $('#modal'); m.innerHTML = editorHTML(); m.classList.add('show'); }
+function redrawEditor() { const n = $('#edname'), e = $('#edemoji'); if (n) draft.name = n.value; if (e) draft.emoji = e.value; $('#modal').innerHTML = editorHTML(); }
+function closeEditor() { const m = $('#modal'); m.classList.remove('show'); m.innerHTML = ''; draft = null; }
+
+/* ---- session views */
+const actBar = (s, extra = '') => {
+  const pr = s.paused ? `<button class="btn go" data-sa="resume">▶ Resume</button>` : `<button class="btn warn" data-sa="pause">❚❚ Pause</button>`;
+  return `<div class="actions">${extra}${pr}<button class="btn danger" data-sa="stop">■ Stop</button></div>`;
+};
+const sessHead = s => `${esc(s.emoji)} ${esc(s.name)} · ${t1(s.target_c)}°C · ${fmtL(s.liters)} L · ${esc(s.pot.label)}${s.frozen ? ' · frozen' : ''}`;
+const RING = 2 * Math.PI * 52;
+const chartCard = id => `<div class="card chartcard"><canvas id="${id}"></canvas></div>`;
+
+function sessionHTML(s) {
+  const ph = s.phase;
+  if (ph === 'water') return `<div class="center"><div class="drop">💧</div><div class="instr">Dispense</div>
+    <div class="huge">${fmtL(s.liters)}<small>L</small></div>
+    <div class="sub">into the <b>${esc(s.pot.label)}</b> pot (${esc(s.pot.range)}) · ${sessHead(s)}</div>
+    <div class="sub">Use the water dispenser, then tap continue.</div>
+    <div class="actions" style="width:100%"><button class="btn" data-sa="cancel">Cancel</button><button class="btn go big" data-sa="water_ok">Water is in ✓</button></div></div>`;
+  if (ph === 'connect') return `<div class="center"><div class="drop pulse">🔌</div><div class="instr">Plug in the cooker</div>
+    <div class="sub" id="connmsg">Waiting for the connection…</div><div class="sub">${sessHead(s)}</div>
+    <div class="actions" style="width:100%"><button class="btn" data-sa="cancel">Cancel</button></div></div>`;
+  if (ph === 'armed') return `<div class="center"><div class="drop ok">✓</div><div class="instr">Connected — target set to <span class="hot">${t1(s.target_c)} °C</span></div>
+    <div class="sub">Bath is at <b id="temp">--.-</b> °C. Press <b>Start</b> on the cooker, or tap Start here.</div>
+    <div class="actions" style="width:100%"><button class="btn" data-sa="cancel">Cancel</button><button class="btn" data-sa="cooker_started">I started it on the cooker</button><button class="btn go big" data-sa="start">▶ Start</button></div></div>`;
+  if (ph === 'preheat' || ph === 'ready') {
+    const rdy = ph === 'ready';
+    return `<div class="two"><div class="card hero"><div class="label">${sessHead(s)}</div>
+      <div id="phaselbl" class="instr ${rdy ? 'ok pulse' : ''}">${rdy ? 'Bath ready — add the food' : 'Preheating'}</div>
+      <div class="bigtemp"><span id="temp">--.-</span><small>°C</small></div>
+      <div class="sub">target <b>${t1(s.target_c)}</b> °C</div>
+      ${rdy ? `<div class="sub" id="rdysub">Waiting for the temperature dip when food goes in…</div>`
+            : `<div class="bar"><i id="prebar" style="width:0%"></i></div><div class="eta"><span id="eta">…</span><span class="tag" id="etasrc"></span></div><div class="sub" id="etafoot"></div>`}
+      <div id="pausedbox"></div></div>${chartCard('chart')}</div>
+      ${actBar(s, rdy ? `<button class="btn go" data-sa="food_in">Food is in</button>` : '')}`;
+  }
+  if (ph === 'cook' || ph === 'done') {
+    const done = ph === 'done';
+    return `<div class="cookgrid"><div class="card hero"><div class="label">${sessHead(s)}</div>
+        <div class="ringwrap ${done ? 'done' : ''}"><svg viewBox="0 0 120 120"><circle class="rbg" cx="60" cy="60" r="52"/><circle class="rfg" id="ring" cx="60" cy="60" r="52" stroke-dasharray="${RING}" stroke-dashoffset="${RING}"/></svg>
+          <div class="ringtxt">${done ? `<span class="ok">Complete · overtime</span><b class="ok" id="ot">+0:00</b>` : `<span>Remaining</span><b id="remain">--</b>`}</div></div>
+        <div class="sub" id="cookfoot"></div><div id="pausedbox"></div></div>
+      <div class="col"><div class="stats"><div class="card stat"><span class="label">Bath</span><b id="temp">--.-<small>°C</small></b></div>
+        <div class="card stat"><span class="label">Target</span><b>${t1(s.target_c)}<small>°C</small></b></div>
+        <div class="card stat"><span class="label">${done ? 'Total cook time' : 'Elapsed'}</span><b id="elapsed">0:00</b></div></div>
+        <div class="card dipbox" id="dipbox"></div>${chartCard('chart')}</div></div>
+      ${actBar(s)}`;
+  }
+  if (ph === 'ended') return `<div class="center"><div class="drop">🍽️</div><div class="instr">${esc(s.name)} — cook ended</div><div class="sub">${esc(s.end_reason || '')}</div>
+    <div class="summary"><div class="card stat"><span class="label">Time at temperature</span><b>${hms(s.elapsed_s)}</b></div>
+    <div class="card stat"><span class="label">Overtime</span><b>${s.overtime_s > 0 ? '+' + hms(s.overtime_s) : '—'}</b></div>
+    <div class="card stat"><span class="label">Planned</span><b>${hms(s.total_s)}</b></div></div>
+    <div id="enddip" class="sub"></div>
+    <div class="actions" style="width:100%"><button class="btn go big" data-sa="dismiss">Done</button></div></div>`;
+  return '';
+}
+
+function dipHTML(s) {
+  const d = s.dip;
+  if (!d) return `<div class="dtxt"><b>Food-in dip</b><div>${s.phase === 'cook' || s.phase === 'done' ? 'Not recorded (timer was started manually).' : ''}</div></div>`;
+  const head = d.active
+    ? `<b class="warnc">⬇ Recovering…</b><div>Low so far <b>${t1(d.low_c)} °C</b> (−${d.depth_c.toFixed(1)} °C)<br>Back to temperature: <b>${hms(d.recovery_s)}</b> and counting</div>`
+    : `<b class="ok">✓ Back at temperature in ${hms(d.recovery_s)}</b><div>Dropped to <b>${t1(d.low_c)} °C</b> (−${d.depth_c.toFixed(1)} °C)<br>about ${hms(d.low_after_s)} after the food went in</div>`;
+  return `<div class="dtxt">${head}</div><canvas id="dipchart"></canvas>`;
+}
+
+/* ------------------------------------------------------------------- render */
+function connText() {
+  const c = ST.conn, s = ST.session;
+  if (s && s.lost) return ['bad', 'Signal lost — retrying…'];
+  if (c.state === 'connected' || (s && ['armed','preheat','ready','cook','done'].includes(s.phase) && ST.tel.temp_c != null)) return ['ok', `Cooker connected${ST.tel.temp_c != null ? ' · ' + t1(ST.tel.temp_c) + ' °C' : ''}`];
+  if (c.state === 'scanning') return ['warn', 'Searching for cooker…'];
+  if (c.state === 'reconnecting') return ['warn', 'Reconnecting…'];
+  return ['', 'Cooker idle · no signal'];
+}
+function renderHeader() {
+  const [cls, txt] = connText(); $('#conndot').className = 'dot ' + cls; setText('conntxt', txt);
+  $('#snd').style.display = (Au.ctx && Au.ctx.state === 'running') ? 'none' : 'flex';
+  $('#simbar').style.display = ST.sim ? 'flex' : 'none';
+  const b = [], s = ST.session;
+  if (ST.tel.water_low && s && s.phase !== 'ended') b.push(`<div class="banner bad">💧 Water level is low — add water to the pot</div>`);
+  if (s && s.lost) b.push(`<div class="banner warn">📡 Lost contact with the cooker. It keeps heating on its own; the timer keeps running. Reconnecting…</div>`);
+  if (s && s.paused && s.pause_src === 'cooker') b.push(`<div class="banner warn">❚❚ Paused on the cooker — press its button or Resume here to continue</div>`);
+  setHTML('banner', b.join(''));
+}
+
+function render() {
+  if (!SET || !ST) return;
+  const s = ST.session;
+  const key = s ? `s:${s.phase}:${s.paused}:${s.name}` : `v:${view}:${stab}`;
+  if (key !== lastKey) {
+    lastKey = key;
+    $('#main').innerHTML = s ? sessionHTML(s) : ({home: homeHTML, setup: setupHTML, manual: manualHTML, settings: settingsHTML}[view] || homeHTML)();
+    if (s) wake();
+  }
+  renderHeader();
+  if (s) updateSession(s);
+}
+
+function setTemp(v) {
+  const el = document.getElementById('temp'); if (!el) return;
+  const n = el.firstChild;
+  if (n && n.nodeType === 3) { if (n.nodeValue !== v) n.nodeValue = v; } else el.insertBefore(document.createTextNode(v), el.firstChild);
+}
+function updateSession(s) {
+  const ph = s.phase;
+  if (ph === 'connect') setText('connmsg', ST.conn.msg || (ST.conn.state === 'scanning' ? 'Searching for the cooker…' : 'Waiting for the connection…'));
+  setTemp(t1(s.temp_c));
+  const pb = document.getElementById('pausedbox'); if (pb) setHTML('pausedbox', s.paused ? `<span class="pausedtag">❚❚ PAUSED${s.pause_src === 'cooker' ? ' ON COOKER' : ''}</span>` : '');
+  if (ph === 'preheat' && s.pre) {
+    const p = s.pre; document.getElementById('prebar').style.width = (p.progress * 100).toFixed(1) + '%';
+    if (s.paused) { setText('eta', 'Paused'); setText('etasrc', ''); }
+    else {
+      const e = p.eta_s == null ? null : p.eta_s;
+      setText('eta', e == null ? '…' : e < 45 ? 'almost there' : `~${Math.ceil(e / 60)} min left`);
+      setText('etasrc', p.eta_src === 'measured' ? 'live rate' : 'power estimate');
+    }
+    setText('etafoot', `${t1(p.start_temp)} → ${t1(s.target_c)} °C · ${fmtL(s.liters)} L · ${hms(p.duration_s)} so far`);
+    drawChart($('#chart'), s.chart.pts, {target: s.target_c, marks: s.chart.marks});
+  }
+  if (ph === 'ready') {
+    setText('rdysub', s.paused ? '' : 'Waiting for the temperature dip when food goes in…');
+    drawChart($('#chart'), s.chart.pts, {target: s.target_c, marks: s.chart.marks});
+  }
+  if (ph === 'cook' || ph === 'done') {
+    const ring = document.getElementById('ring');
+    if (ring) ring.style.strokeDashoffset = RING * (1 - Math.min(1, s.elapsed_s / s.total_s));
+    if (ph === 'cook') {
+      setText('remain', hms(s.remaining_s));
+      setText('elapsed', hms(s.elapsed_s));
+      const end = !ST.sim && !s.paused ? new Date(Date.now() + s.remaining_s * 1000) : null;
+      setText('cookfoot', end ? `Done around ${end.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})}` : `of ${hms(s.total_s)}`);
+    } else {
+      setText('ot', '+' + hms(s.overtime_s));
+      setText('elapsed', hms(s.elapsed_s));
+      setText('cookfoot', `Planned ${hms(s.total_s)} · holding ${t1(s.target_c)} °C until you stop`);
+    }
+    const db = document.getElementById('dipbox'); if (db) {
+      const h = dipHTML(s); const sig = h; if (db.dataset.sig !== sig) { db.innerHTML = h; db.dataset.sig = sig; }
+    }
+    drawChart($('#chart'), s.chart.pts, {target: s.target_c, marks: s.chart.marks});
+    drawChart($('#dipchart'), s.dip_chart, {target: s.target_c, mini: true});
+  }
+  if (ph === 'ended') {
+    const d = s.dip; setHTML('enddip', d ? `Food-in dip: low of ${t1(d.low_c)} °C (−${d.depth_c.toFixed(1)}), ${d.active ? 'never fully recovered' : 'recovered in ' + hms(d.recovery_s)}.` : '');
+  }
+}
+
+/* ------------------------------------------------------------------ actions */
+async function sessionAction(a) {
+  if (a === 'stop') { const s = ST.session; if (s.phase !== 'done' && !await confirmBox('Stop this cook?', 'Stop cook')) return; }
+  if (a === 'cancel' && ST.session.phase === 'armed' && !await confirmBox('Cancel this cook?', 'Cancel cook')) return;
+  await api('/api/session/action', 'POST', {action: a}); await poll();
+}
+const A = {
+  pick(el) { setup = {i: +el.dataset.i, pot: lastPot, frozen: false}; go('setup'); },
+  back() { view = 'home'; go('home'); },
+  potsel(el) { const id = el.dataset.pot; lastPot = id; localStorage.setItem('pot', id); if (view === 'setup') setup.pot = id; else { man.pot = id; } lastKey = ''; render(); },
+  frozen() { setup.frozen = !setup.frozen; lastKey = ''; render(); },
+  async startfood() { const f = SET.foods[setup.i]; await api('/api/session/start', 'POST', {food_id: f.id, pot: setup.pot, frozen: setup.frozen}); view = 'home'; await poll(); },
+  manual() { man = {pot: lastPot, field: 'temp', temp: '', time: '', liters: ''}; go('manual'); },
+  mfield(el) { man.field = el.dataset.f; lastKey = ''; render(); },
+  async mstart() {
+    const temp = parseFloat(man.temp), mins = timeMin(man.time);
+    if (!(temp >= 20 && temp <= 92)) return toast('Enter a temperature between 20 and 92 °C');
+    if (!(mins >= 1)) return toast('Enter a cook time');
+    await api('/api/session/start', 'POST', {pot: man.pot, manual: {temp_c: temp, time_min: mins, liters: man.liters === '' ? null : parseFloat(man.liters)}});
+    view = 'home'; await poll();
+  },
+  settings() { stab = 'foods'; go('settings'); },
+  stab(el) { stab = el.dataset.t; go('settings'); },
+  edit(el) { openEditor(+el.dataset.i); },
+  edemoji(el) { $('#edemoji').value = el.dataset.e; redrawEditor(); },
+  async ednum(el) {
+    const f = el.dataset.f; const nm = $('#edname'), em = $('#edemoji'); if (nm) draft.name = nm.value; if (em) draft.emoji = em.value;
+    if (f === 'temp_c') { const v = await askNumber({title: 'Temperature', unit: '°C', mode: 'dec', value: draft.temp_c}); if (v != null) draft.temp_c = Math.min(92, Math.max(20, Math.round(v * 10) / 10)); }
+    else if (f === 'time_min') { const v = await askNumber({title: 'Cook time (h:mm)', unit: 'h:mm', mode: 'time', value: draft.time_min}); if (v != null && v >= 1) draft.time_min = Math.min(4320, v); }
+    else if (f === 'frozen_extra_min') { const v = await askNumber({title: 'Extra time when frozen (h:mm)', unit: 'h:mm', mode: 'time', value: draft.frozen_extra_min}); if (v != null) draft.frozen_extra_min = Math.min(4320, v); }
+    else if (f.startsWith('l_')) { const id = f.slice(2); const v = await askNumber({title: `Water for the ${potOf(id).label} pot`, unit: 'L', mode: 'dec', value: draft.liters[id], clearLabel: 'Auto'}); if (v === 'auto') draft.liters[id] = null; else if (v != null) draft.liters[id] = v >= .5 ? Math.min(30, v) : null; }
+    redrawEditor();
+  },
+  async edsave() {
+    const nm = $('#edname'), em = $('#edemoji'); if (nm) draft.name = nm.value.trim(); if (em) draft.emoji = em.value;
+    if (!draft.name) return toast('Give it a name, or use Clear slot');
+    SET.foods[draftIdx] = draft; closeEditor(); await saveSettings(); lastKey = ''; render();
+  },
+  edcancel() { closeEditor(); },
+  async edclear() {
+    if (!await confirmBox('Clear this slot?', 'Clear')) return;
+    Object.assign(SET.foods[draftIdx], {name: '', emoji: '', frozen_extra_min: 0, liters: {small: null, medium: null, large: null}}); closeEditor(); await saveSettings(); lastKey = ''; render();
+  },
+  async potl(el) { const i = +el.dataset.i; const v = await askNumber({title: `Default water — ${SET.pots[i].label} pot`, unit: 'L', mode: 'dec', value: SET.pots[i].liters}); if (v != null && v >= .5) { SET.pots[i].liters = Math.min(30, v); await saveSettings(); lastKey = ''; render(); } },
+  async cfg(el) {
+    const k = el.dataset.key, spec = {
+      power_w: ['Cooker power', 'W', 'int', SET.power_w, v => v], efficiency: ['Heating efficiency', '%', 'int', Math.round(SET.efficiency * 100), v => v / 100],
+      dip_threshold_c: ['Food-in detection drop', '°C', 'dec', SET.dip_threshold_c, v => v], ready_tol_c: ['At-temperature window', '°C', 'dec', SET.ready_tol_c, v => v],
+      ready_reminder_s: ['Reminder interval', 's', 'int', SET.ready_reminder_s, v => v]}[k];
+    const v = await askNumber({title: spec[0], unit: spec[1], mode: spec[2], value: spec[3]});
+    if (v != null) { SET[k] = spec[4](v); await saveSettings(); lastKey = ''; render(); }
+  },
+  async snd(el) { await Au.unlock(); if (el.dataset.t) { Au.vol = SET.volume; Au.play(el.dataset.t); } },
+  async sim(el) { await api('/api/sim/' + el.dataset.n, 'POST'); },
+};
+
+document.addEventListener('click', e => {
+  const sa = e.target.closest('[data-sa]');
+  if (sa) { Au.unlock(); sessionAction(sa.dataset.sa).catch(err => toast(err.message)); return; }
+  const mk = e.target.closest('[data-mk]');
+  if (mk && man) {
+    const f = man.field, mode = f === 'time' ? 'time' : 'dec';
+    man[f] = applyKey(man[f], mk.dataset.mk, mode); lastKey = ''; render(); return;
+  }
+  const el = e.target.closest('[data-act]'); if (!el) return;
+  Au.unlock();
+  const fn = A[el.dataset.act]; if (fn) Promise.resolve(fn(el)).catch(err => toast(err.message));
+});
+document.addEventListener('input', e => {
+  if (e.target.id === 'vol') { SET.volume = +e.target.value; Au.vol = SET.volume; }
+});
+document.addEventListener('change', async e => {
+  const t = e.target;
+  if (t.id === 'vol') { await saveSettings(); Au.play('cookstart'); }
+  if (t.dataset && (t.dataset.pl !== undefined || t.dataset.pr !== undefined)) {
+    if (t.dataset.pl !== undefined) SET.pots[+t.dataset.pl].label = t.value.trim() || SET.pots[+t.dataset.pl].label;
+    else SET.pots[+t.dataset.pr].range = t.value.trim();
+    await saveSettings();
+  }
+});
+
+/* --------------------------------------------------------------------- poll */
+let polling = false;
+async function poll() {
+  if (polling) return; polling = true;
+  try {
+    ST = await api('/api/state');
+    Au.vol = ST.volume;
+    if (seenEv === null) seenEv = ST.last_event_id;
+    ST.events.filter(e => e.id > seenEv).forEach(e => { seenEv = Math.max(seenEv, e.id); Au.play(e.type); });
+    render();
+  } catch (e) { setText('conntxt', 'Server not reachable'); $('#conndot').className = 'dot bad'; }
+  finally { polling = false; }
+}
+(async function boot() {
+  try { SET = await api('/api/settings'); } catch (e) { setTimeout(boot, 1500); return; }
+  await poll();
+  setInterval(poll, 1000);
+  setInterval(() => { $('#clock').textContent = new Date().toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}); }, 1000);
+  $('#clock').textContent = new Date().toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+  window.addEventListener('resize', () => { if (ST && ST.session) updateSession(ST.session); });
+})();
+</script>
+</body>
+</html>
