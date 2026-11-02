@@ -1,0 +1,1910 @@
+diff --git a/api_v1.py b/api_v1.py
+new file mode 100644
+index 0000000..5f38ff6
+--- /dev/null
++++ b/api_v1.py
+@@ -0,0 +1,599 @@
++"""
++Sous Vide Assistant - scripting API (v1)
++========================================
++
++Adds a documented, script-friendly HTTP API under /api/v1/ on top of the
++existing app. Nothing in the UI or the cook engine changes: every endpoint here
++reads the same App object or calls the same methods the touchscreen UI uses
++(start_session / action / settings), so scripts and the UI always agree.
++
++Full reference: docs/API.md   (machine-readable: docs/openapi.yaml)
++
++Wired in from app.py with:
++
++    api_v1.install(web_app, app_state, sys.modules[__name__], token=...)
++
++`deps` is the app module itself; it is passed in (instead of imported) so this
++file never imports app.py, which would load it a second time when app.py is
++run as a script.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import copy
++import csv
++import hmac
++import io
++import json
++import logging
++import math
++import time
++from datetime import datetime, timezone
++from pathlib import Path
++
++from aiohttp import web
++
++log = logging.getLogger("sousvide.api")
++
++API_VERSION = "1.0"
++
++ACTIONS = ("water_ok", "start", "cooker_started", "pause", "resume",
++           "food_in", "stop", "cancel", "dismiss")
++LIVE_PHASES = ("preheat", "ready", "cook", "done")
++SIM_ACTIONS = ("food", "lowwater", "refill", "unplug")
++
++SCALAR_SETTINGS = {
++    "power_w": "num", "efficiency": "num", "dip_threshold_c": "num",
++    "ready_tol_c": "num", "ready_reminder_s": "num", "unplug_end_s": "num",
++    "detect_pause_from_motor": "bool", "volume": "num",
++}
++POT_FIELDS = {"label": "str", "range": "str", "liters": "num"}
++FOOD_FIELDS = {"name": "str", "emoji": "str", "temp_c": "num", "time_min": "num",
++               "frozen_extra_min": "num", "liters": "liters"}
++POT_IDS = ("small", "medium", "large")
++
++AUTO_START_TIMEOUT_S = 900
++
++
++# --------------------------------------------------------------------------- #
++# Small helpers
++# --------------------------------------------------------------------------- #
++
++def _is_num(v) -> bool:
++    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
++
++
++def _r(v, nd=2):
++    return None if v is None else round(v, nd)
++
++
++def _c2f(c):
++    return None if c is None else round(c * 9 / 5 + 32, 2)
++
++
++def _iso(ts: float | None = None) -> str:
++    dt = datetime.fromtimestamp(ts, timezone.utc) if ts is not None else datetime.now(timezone.utc)
++    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
++
++
++def _json(data, status=200):
++    return web.json_response(data, status=status, headers={"Cache-Control": "no-store"})
++
++
++def _sse(event: str, data, eid=None) -> bytes:
++    head = f"id: {eid}\n" if eid is not None else ""
++    return f"{head}event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
++
++
++def available_actions(phase: str, paused: bool) -> list[str]:
++    """Mirror of the rules in App.action(): what a script may call right now."""
++    if phase == "water":
++        return ["water_ok", "cancel"]
++    if phase == "connect":
++        return ["cancel"]
++    if phase == "armed":
++        return ["start", "cooker_started", "cancel"]
++    if phase in LIVE_PHASES:
++        acts = ["resume" if paused else "pause"]
++        if phase == "ready":
++            acts.append("food_in")
++        acts.append("stop")
++        return acts
++    if phase == "ended":
++        return ["dismiss"]
++    return []
++
++
++# --------------------------------------------------------------------------- #
++# API object
++# --------------------------------------------------------------------------- #
++
++class Api:
++    def __init__(self, state, deps, token):
++        self.state = state
++        self.deps = deps
++        self.ApiError = deps.ApiError
++        self.token = token or None
++        self._tasks: set[asyncio.Task] = set()
++        self._auto_session = None
++
++    # ---- errors / parsing ---------------------------------------------
++
++    def err(self, msg, status=400):
++        return self.ApiError(msg, status)
++
++    async def body(self, request, *, required=False) -> dict:
++        if not request.can_read_body:
++            if required:
++                raise self.err("A JSON request body is required")
++            return {}
++        try:
++            data = await request.json()
++        except Exception:
++            raise self.err("Request body must be valid JSON")
++        if not isinstance(data, dict):
++            raise self.err("Request body must be a JSON object")
++        return data
++
++    # ---- middleware ---------------------------------------------------
++
++    @web.middleware
++    async def middleware(self, request, handler):
++        if self.token and request.path.rstrip("/") != "/api/v1/health":
++            supplied = ""
++            auth = request.headers.get("Authorization", "")
++            if auth.lower().startswith("bearer "):
++                supplied = auth[7:].strip()
++            elif "X-API-Key" in request.headers:
++                supplied = request.headers["X-API-Key"].strip()
++            if not hmac.compare_digest(supplied.encode(), self.token.encode()):
++                return web.json_response(
++                    {"error": "Unauthorized: send 'Authorization: Bearer <token>'"},
++                    status=401, headers={"WWW-Authenticate": "Bearer"})
++        try:
++            return await handler(request)
++        except self.ApiError as e:
++            return _json({"error": str(e)}, e.status)
++        except web.HTTPException as e:
++            return _json({"error": e.reason or "error"}, e.status)
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            log.exception("API handler failed: %s %s", request.method, request.path)
++            return _json({"error": "Internal error"}, 500)
++
++    # ---- status builders ----------------------------------------------
++
++    def status(self) -> dict:
++        st = self.state
++        snap = st.snapshot()
++        conn, tel, sess = snap["conn"], snap["tel"], snap["session"]
++        connected = bool(st.adapter.connected)
++        out = {
++            "api_version": API_VERSION,
++            "timestamp": _iso(),
++            "simulator": snap["sim"],
++            "connection": {
++                "state": conn["state"],
++                "connected": connected,
++                "message": conn.get("msg") or None,
++            },
++            "cooker": {
++                "water_temp_c": _r(tel["temp_c"]),
++                "water_temp_f": _c2f(tel["temp_c"]),
++                "water_low": tel["water_low"],
++                "motor_speed": st.tel.get("motor") if connected else None,
++                "telemetry_age_s": tel["age_s"],
++            },
++            "last_event_id": snap["last_event_id"],
++            "cook": None,
++        }
++        if snap["sim"]:
++            out["sim_speed"] = snap["speed"]
++        if sess is not None:
++            out["cook"] = self._cook_view(sess)
++        return out
++
++    def _cook_view(self, s: dict) -> dict:
++        c = {
++            "phase": s["phase"],
++            "paused": s["paused"],
++            "pause_source": s["pause_src"],
++            "name": s["name"],
++            "emoji": s["emoji"],
++            "manual": s["manual"],
++            "frozen": s["frozen"],
++            "pot": s["pot"],
++            "liters": s["liters"],
++            "target_c": s["target_c"],
++            "target_f": _c2f(s["target_c"]),
++            "total_s": round(s["total_s"], 1),
++            "base_s": s["base_s"],
++            "extra_s": s["extra_s"],
++            "elapsed_s": round(s["elapsed_s"], 1),
++            "remaining_s": round(s["remaining_s"], 1),
++            "overtime_s": round(s["overtime_s"], 1),
++            "cooker_link_lost": s["lost"],
++            "end_reason": s["end_reason"],
++            "session_s": round(s["session_s"], 1),
++            "auto_start_pending": self._auto_session is not None
++                                  and self._auto_session is self.state.session,
++            "available_actions": available_actions(s["phase"], s["paused"]),
++            "preheat": None,
++            "dip": None,
++        }
++        pre = s.get("pre")
++        if pre:
++            c["preheat"] = {
++                "start_temp_c": _r(pre["start_temp"]),
++                "eta_s": _r(pre["eta_s"], 0),
++                "eta_source": pre["eta_src"],
++                "progress": _r(pre["progress"], 3),
++                "duration_s": round(pre["duration_s"], 1),
++            }
++        dip = s.get("dip")
++        if dip:
++            c["dip"] = {
++                "active": dip["active"],
++                "low_c": dip["low_c"],
++                "depth_c": dip["depth_c"],
++                "recovery_s": round(dip["recovery_s"], 1),
++                "low_after_s": round(dip["low_after_s"], 1),
++            }
++        return c
++
++    # ---- read endpoints -----------------------------------------------
++
++    async def health(self, request):
++        return _json({"ok": True, "api_version": API_VERSION,
++                      "simulator": self.state.sim, "auth_required": bool(self.token)})
++
++    async def get_status(self, request):
++        return _json(self.status())
++
++    async def get_cook(self, request):
++        return _json({"cook": self.status()["cook"]})
++
++    async def get_events(self, request):
++        try:
++            after = int(request.query.get("after", 0))
++        except ValueError:
++            raise self.err("'after' must be an integer")
++        st = self.state
++        return _json({
++            "events": [e for e in st.events if e["id"] > after],
++            "last_event_id": st._eid,
++        })
++
++    async def get_history(self, request):
++        st = self.state
++        s = st.session
++        if s is None:
++            raise self.err("No cook in progress", 404)
++        q = request.query
++        try:
++            since = float(q.get("since", -1))
++            max_points = int(q.get("max_points", 0))
++        except ValueError:
++            raise self.err("'since' must be a number and 'max_points' an integer")
++        fmt = q.get("format", "json")
++        if fmt not in ("json", "csv"):
++            raise self.err("'format' must be json or csv")
++
++        speed = st.clock.speed or 1.0
++        wall_start = time.time() - (st.clock.now() - s.created) / speed
++        rows = [(round(t - s.created, 1), round(v, 3)) for t, v in s.samples
++                if (t - s.created) > since]
++        if max_points >= 2:
++            rows = self.deps.decimate(rows, max_points)
++
++        if fmt == "csv":
++            buf = io.StringIO()
++            w = csv.writer(buf)
++            w.writerow(["t_s", "timestamp", "temp_c"])
++            for t, v in rows:
++                w.writerow([t, _iso(wall_start + t / speed), v])
++            return web.Response(text=buf.getvalue(), content_type="text/csv",
++                                headers={"Cache-Control": "no-store"})
++
++        return _json({
++            "session_started_at": _iso(wall_start),
++            "name": s.name,
++            "phase": s.phase,
++            "columns": ["t_s", "temp_c"],
++            "samples": [list(r) for r in rows],
++            "markers": [{"t_s": round(t - s.created, 1), "kind": k} for t, k in s.markers],
++            "next_since": rows[-1][0] if rows else max(since, 0),
++        })
++
++    async def stream(self, request):
++        try:
++            interval = float(request.query.get("interval", 1.0))
++        except ValueError:
++            raise self.err("'interval' must be a number")
++        interval = max(0.25, min(30.0, interval))
++        st = self.state
++        resp = web.StreamResponse(headers={
++            "Content-Type": "text/event-stream",
++            "Cache-Control": "no-store",
++            "X-Accel-Buffering": "no",
++        })
++        await resp.prepare(request)
++        last_id = st._eid
++        try:
++            await resp.write(b"retry: 3000\n\n")
++            while True:
++                for e in [e for e in st.events if e["id"] > last_id]:
++                    last_id = e["id"]
++                    await resp.write(_sse("cook_event", e, eid=e["id"]))
++                await resp.write(_sse("status", self.status()))
++                await asyncio.sleep(interval)
++        except (ConnectionResetError, ConnectionError, asyncio.CancelledError):
++            pass
++        return resp
++
++    # ---- settings -----------------------------------------------------
++
++    async def get_settings(self, request):
++        return _json(self.state.settings)
++
++    async def put_settings(self, request):
++        body = await self.body(request, required=True)
++        return self._commit_settings(self.deps.sanitize_settings(body))
++
++    async def patch_settings(self, request):
++        body = await self.body(request, required=True)
++        return self._commit_settings(self._merge(self.state.settings, body))
++
++    def _commit_settings(self, new: dict):
++        self.state.settings = new
++        self.deps.save_settings(new)
++        return _json(new)
++
++    def _check(self, kind, field, v):
++        if kind == "num":
++            ok = _is_num(v)
++        elif kind == "bool":
++            ok = isinstance(v, bool)
++        elif kind == "str":
++            ok = isinstance(v, str)
++        elif kind == "liters":
++            ok = isinstance(v, dict) and all(
++                k in POT_IDS and (x is None or _is_num(x)) for k, x in v.items())
++        else:
++            ok = False
++        if not ok:
++            want = {"num": "a number", "bool": "true or false", "str": "a string",
++                    "liters": "an object like {\"small\": 5.0, \"medium\": null}"}[kind]
++            raise self.err(f"'{field}' must be {want}", 422)
++
++    def _merge(self, cur: dict, patch: dict) -> dict:
++        """Apply a partial update. Unknown fields are rejected (422);
++        values are then clamped by the same sanitiser the UI uses."""
++        unknown = [k for k in patch if k not in SCALAR_SETTINGS and k not in ("pots", "foods")]
++        if unknown:
++            raise self.err(f"Unknown setting(s): {', '.join(unknown)}", 422)
++        new = copy.deepcopy(cur)
++        for key, val in patch.items():
++            if key in SCALAR_SETTINGS:
++                self._check(SCALAR_SETTINGS[key], key, val)
++                new[key] = val
++                continue
++            if not isinstance(val, list):
++                raise self.err(f"'{key}' must be a list of objects with an 'id'", 422)
++            types = POT_FIELDS if key == "pots" else FOOD_FIELDS
++            index = {x["id"]: x for x in new[key]}
++            for item in val:
++                if not isinstance(item, dict) or "id" not in item:
++                    raise self.err(f"Every entry in '{key}' needs an 'id'", 422)
++                tgt = index.get(item["id"])
++                if tgt is None:
++                    raise self.err(f"Unknown {key[:-1]} id '{item['id']}'", 422)
++                for f, v in item.items():
++                    if f == "id":
++                        continue
++                    if f not in types:
++                        raise self.err(f"Unknown {key[:-1]} field '{f}'", 422)
++                    self._check(types[f], f, v)
++                    if f == "liters" and key == "foods":
++                        tgt["liters"].update(v)
++                    else:
++                        tgt[f] = v
++        return self.deps.sanitize_settings(new)
++
++    # ---- presets / pots -----------------------------------------------
++
++    @staticmethod
++    def _preset_view(i: int, f: dict) -> dict:
++        return {"slot": i + 1, "empty": not f["name"], **f}
++
++    async def list_presets(self, request):
++        return _json({"presets": [self._preset_view(i, f)
++                                  for i, f in enumerate(self.state.settings["foods"])]})
++
++    def _find_preset(self, pid):
++        for i, f in enumerate(self.state.settings["foods"]):
++            if f["id"] == pid:
++                return i, f
++        raise self.err(f"No preset with id '{pid}'", 404)
++
++    async def get_preset(self, request):
++        i, f = self._find_preset(request.match_info["id"])
++        return _json(self._preset_view(i, f))
++
++    async def patch_preset(self, request):
++        pid = request.match_info["id"]
++        self._find_preset(pid)
++        body = await self.body(request, required=True)
++        if body.get("id", pid) != pid:
++            raise self.err("'id' in the body does not match the URL", 422)
++        body["id"] = pid
++        self._commit_settings(self._merge(self.state.settings, {"foods": [body]}))
++        i, f = self._find_preset(pid)
++        return _json(self._preset_view(i, f))
++
++    async def list_pots(self, request):
++        return _json({"pots": self.state.settings["pots"]})
++
++    async def patch_pot(self, request):
++        pid = request.match_info["id"]
++        if pid not in POT_IDS:
++            raise self.err(f"No pot with id '{pid}'", 404)
++        body = await self.body(request, required=True)
++        if body.get("id", pid) != pid:
++            raise self.err("'id' in the body does not match the URL", 422)
++        body["id"] = pid
++        self._commit_settings(self._merge(self.state.settings, {"pots": [body]}))
++        return _json(next(p for p in self.state.settings["pots"] if p["id"] == pid))
++
++    # ---- cook control -------------------------------------------------
++
++    def _resolve_pot(self, v) -> str:
++        pots = self.state.settings["pots"]
++        if isinstance(v, str):
++            for p in pots:
++                if v.strip().lower() in (p["id"].lower(), p["label"].lower()):
++                    return p["id"]
++        raise self.err("'pot' is required and must be one of: "
++                       + ", ".join(f"{p['id']} ({p['label']})" for p in pots), 422)
++
++    def _resolve_preset(self, v) -> str:
++        foods = self.state.settings["foods"]
++        if isinstance(v, str):
++            key = v.strip().lower()
++            for f in foods:
++                if f["id"].lower() == key:
++                    return f["id"]
++            for f in foods:
++                if f["name"] and f["name"].lower() == key:
++                    return f["id"]
++        raise self.err(f"Unknown preset {v!r}; use a preset id (f1..f{len(foods)}) or its exact name", 422)
++
++    async def start_cook(self, request):
++        body = await self.body(request, required=True)
++        unknown = [k for k in body if k not in
++                   ("preset", "manual", "pot", "frozen", "confirm_water", "auto_start")]
++        if unknown:
++            raise self.err(f"Unknown field(s): {', '.join(unknown)}", 422)
++        if ("preset" in body) == ("manual" in body):
++            raise self.err("Provide exactly one of 'preset' or 'manual'", 422)
++        for flag in ("frozen", "confirm_water", "auto_start"):
++            if flag in body and not isinstance(body[flag], bool):
++                raise self.err(f"'{flag}' must be true or false", 422)
++        auto = body.get("auto_start", False)
++        confirm = body.get("confirm_water", False) or auto
++        if auto and not body.get("confirm_water", False):
++            raise self.err("'auto_start' also needs 'confirm_water': true "
++                           "(you are asserting the pot is filled)", 422)
++        payload = {"pot": self._resolve_pot(body.get("pot"))}
++        if "preset" in body:
++            payload["food_id"] = self._resolve_preset(body["preset"])
++            payload["frozen"] = bool(body.get("frozen", False))
++        else:
++            m = body["manual"]
++            if not isinstance(m, dict):
++                raise self.err("'manual' must be an object", 422)
++            bad = [k for k in m if k not in ("temp_c", "time_min", "liters")]
++            if bad:
++                raise self.err(f"Unknown manual field(s): {', '.join(bad)}", 422)
++            for k in ("temp_c", "time_min"):
++                if not _is_num(m.get(k)):
++                    raise self.err(f"manual.{k} is required and must be a number", 422)
++            if m.get("liters") is not None and not _is_num(m["liters"]):
++                raise self.err("manual.liters must be a number", 422)
++            payload["manual"] = {k: m.get(k) for k in ("temp_c", "time_min", "liters")}
++
++        st = self.state
++        st.start_session(payload)          # raises 409 if a cook is already running
++        session = st.session
++        if confirm:
++            await st.action("water_ok")
++        if auto:
++            self._schedule_auto_start(session)
++        return _json({"ok": True, "status": self.status()}, 201)
++
++    def _schedule_auto_start(self, session):
++        self._auto_session = session
++        task = asyncio.create_task(self._auto_start(session))
++        self._tasks.add(task)
++        task.add_done_callback(self._tasks.discard)
++
++    async def _auto_start(self, session):
++        st = self.state
++        deadline = time.monotonic() + AUTO_START_TIMEOUT_S
++        try:
++            while time.monotonic() < deadline:
++                if st.session is not session or session.phase not in ("connect", "armed"):
++                    return
++                if session.phase == "armed":
++                    await st.action("start")
++                    return
++                await asyncio.sleep(0.5)
++            log.warning("auto_start gave up: cooker never reached 'armed' within %ds",
++                        AUTO_START_TIMEOUT_S)
++        except self.ApiError as e:
++            log.warning("auto_start could not start the cooker: %s", e)
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            log.exception("auto_start failed")
++        finally:
++            if self._auto_session is session:
++                self._auto_session = None
++
++    async def do_action(self, request):
++        name = request.match_info["action"]
++        if name not in ACTIONS:
++            raise self.err(f"Unknown action '{name}'. Valid: {', '.join(ACTIONS)}", 404)
++        await self.state.action(name)
++        return _json({"ok": True, "action": name, "status": self.status()})
++
++    async def do_sim(self, request):
++        name = request.match_info["name"]
++        if name not in SIM_ACTIONS:
++            raise self.err(f"Unknown sim action '{name}'. Valid: {', '.join(SIM_ACTIONS)}", 404)
++        self.state.sim_action(name)
++        return _json({"ok": True, "sim_action": name})
++
++    async def openapi(self, request):
++        path = Path(__file__).resolve().parent / "docs" / "openapi.yaml"
++        if not path.exists():
++            raise self.err("docs/openapi.yaml not found", 404)
++        return web.Response(text=path.read_text(encoding="utf-8"),
++                            content_type="application/yaml")
++
++
++# --------------------------------------------------------------------------- #
++# Install
++# --------------------------------------------------------------------------- #
++
++def install(web_app: web.Application, state, deps, token: str | None = None) -> Api:
++    api = Api(state, deps, token)
++    sub = web.Application(middlewares=[api.middleware])
++    sub.add_routes([
++        web.get("/health", api.health),
++        web.get("/openapi.yaml", api.openapi),
++        # telemetry
++        web.get("/status", api.get_status),
++        web.get("/stream", api.stream),
++        web.get("/events", api.get_events),
++        web.get("/history", api.get_history),
++        # cook control
++        web.get("/cook", api.get_cook),
++        web.post("/cook", api.start_cook),
++        web.post("/cook/actions/{action}", api.do_action),
++        # settings
++        web.get("/settings", api.get_settings),
++        web.put("/settings", api.put_settings),
++        web.patch("/settings", api.patch_settings),
++        web.get("/presets", api.list_presets),
++        web.get("/presets/{id}", api.get_preset),
++        web.patch("/presets/{id}", api.patch_preset),
++        web.get("/pots", api.list_pots),
++        web.patch("/pots/{id}", api.patch_pot),
++        # simulator hooks (404 unless started with --sim)
++        web.post("/sim/{name}", api.do_sim),
++    ])
++    web_app.add_subapp("/api/v1", sub)
++    return api
+diff --git a/app.py b/app.py
+index 34561cc..26a7c54 100644
+--- a/app.py
++++ b/app.py
+@@ -34,6 +34,8 @@ from pathlib import Path
+ 
+ from aiohttp import web
+ 
++import api_v1  # scripting API under /api/v1 (see docs/API.md)
++
+ log = logging.getLogger("sousvide")
+ 
+ BASE = Path(__file__).resolve().parent
+@@ -917,7 +919,7 @@ class App:
+ # HTTP
+ # --------------------------------------------------------------------------- #
+ 
+-def make_web_app(app_state: App) -> web.Application:
++def make_web_app(app_state: App, api_token: str | None = None) -> web.Application:
+     @web.middleware
+     async def errors(request, handler):
+         try:
+@@ -967,6 +969,8 @@ def make_web_app(app_state: App) -> web.Application:
+         web.post("/api/sim/{name}", sim),
+     ])
+ 
++    api_v1.install(app, app_state, sys.modules[__name__], token=api_token)
++
+     async def on_start(app_):
+         app_["tasks"] = [asyncio.create_task(app_state.conn_loop()),
+                          asyncio.create_task(app_state.tick_loop())]
+@@ -987,6 +991,8 @@ def main():
+     ap.add_argument("--port", type=int, default=8080)
+     ap.add_argument("--sim", action="store_true", help="simulated cooker (no Bluetooth needed)")
+     ap.add_argument("--speed", type=float, default=1.0, help="simulator time multiplier")
++    ap.add_argument("--api-token", default=os.environ.get("SOUSVIDE_API_TOKEN"),
++                    help="require this bearer token on /api/v1/* (or set SOUSVIDE_API_TOKEN)")
+     ap.add_argument("-v", "--verbose", action="store_true")
+     a = ap.parse_args()
+     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+@@ -995,7 +1001,9 @@ def main():
+     lib = None if a.sim else load_library()
+     state = App(a.sim, a.speed, lib)
+     print(f"Sous Vide Assistant on http://{a.host}:{a.port}  ({'SIMULATOR x%g' % a.speed if a.sim else 'real cooker'})")
+-    web.run_app(make_web_app(state), host=a.host, port=a.port, print=None)
++    print(f"Scripting API on http://{a.host}:{a.port}/api/v1/ "
++          f"({'bearer token required' if a.api_token else 'NO AUTH'})")
++    web.run_app(make_web_app(state, a.api_token), host=a.host, port=a.port, print=None)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/docs/API.md b/docs/API.md
+new file mode 100644
+index 0000000..954b7ee
+--- /dev/null
++++ b/docs/API.md
+@@ -0,0 +1,611 @@
++# Sous Vide Assistant — HTTP API
++
++Everything the touchscreen UI can do is available over HTTP, so scripts, cron jobs, Home Assistant, shell one-liners, etc. can read telemetry, start and control cooks, and edit settings.
++
++There are two layers:
++
++| Layer | Base path | Use it for |
++|---|---|---|
++| **Scripting API v1** (this document's main part) | `/api/v1/` | Scripts and integrations. Documented, validated, optional token auth, live stream. |
++| **Legacy UI endpoints** (unchanged) | `/api/…` | What `index.html` talks to. Documented at the bottom for completeness. |
++
++Both layers drive the same in-memory cook session, so the UI and your scripts always agree. If a script starts a cook, the touchscreen shows it; if someone presses *Pause* on the screen, `/api/v1/status` reports `paused: true`.
++
++- [Quick start](#quick-start)
++- [Conventions](#conventions)
++- [Authentication](#authentication)
++- [The cook lifecycle](#the-cook-lifecycle)
++- [Telemetry endpoints](#telemetry-endpoints) — `status`, `stream`, `events`, `history`
++- [Cook control endpoints](#cook-control-endpoints) — `POST /cook`, actions
++- [Settings endpoints](#settings-endpoints) — `settings`, `presets`, `pots`
++- [Simulator endpoints](#simulator-endpoints)
++- [Object reference](#object-reference)
++- [Recipes](#recipes)
++- [Legacy UI endpoints](#legacy-ui-endpoints)
++- [Behavior notes and caveats](#behavior-notes-and-caveats)
++
++---
++
++## Quick start
++
++```bash
++# server (real cooker)
++python3 app.py --host 0.0.0.0 --api-token "$(openssl rand -hex 16)"
++# or, with no hardware, at 60x speed:
++python3 app.py --sim --speed 60 --api-token test
++
++export SV=http://127.0.0.1:8080/api/v1
++export AUTH="Authorization: Bearer test"
++
++curl -s -H "$AUTH" $SV/status                      # telemetry snapshot
++
++curl -s -H "$AUTH" -H 'Content-Type: application/json' -X POST $SV/cook -d '{
++  "preset": "Chicken Breast", "pot": "small",
++  "confirm_water": true, "auto_start": true
++}'                                                   # start a full cook, hands-free
++
++curl -s -H "$AUTH" -X POST $SV/cook/actions/food_in  # tell it the food is in the bath
++curl -N -H "$AUTH" $SV/stream                        # live telemetry + chime events
++```
++
++A ready-made command-line client using only the Python standard library is in [`examples/svctl.py`](../examples/svctl.py).
++
++The same API spec in machine-readable form is in [`docs/openapi.yaml`](openapi.yaml) and is also served by the app at `GET /api/v1/openapi.yaml`.
++
++---
++
++## Conventions
++
++- **Format:** requests and responses are JSON (`Content-Type: application/json`), UTF-8. Responses carry `Cache-Control: no-store`.
++- **Units:** temperatures are **°C** everywhere in requests, storage and responses. Read-only convenience fields ending in `_f` (`water_temp_f`, `target_f`) give °F. Durations are **seconds** (`*_s`), except preset/manual cook times, which are **minutes** (`time_min`, `frozen_extra_min`), as in the UI. Volumes are litres.
++- **Timestamps:** ISO-8601 UTC with milliseconds, e.g. `2026-11-02T04:35:49.002Z`.
++- **Errors:** every error has the form `{"error": "human readable message"}` with one of these HTTP statuses:
++
++| Status | Meaning |
++|---|---|
++| `400` | Request rejected by the cook engine's own validation (e.g. manual temperature out of range), or malformed JSON/query. |
++| `401` | Missing or wrong token (only when the server was started with `--api-token`). |
++| `404` | Unknown route/preset/pot/action, or no cook in progress for `/history`. |
++| `409` | Request is valid but not allowed right now (a cook is already running; action not available in the current phase). |
++| `422` | Request was understood but a field is missing, unknown, or the wrong type. |
++| `502` | The Bluetooth command to the cooker failed (`start`, `pause`, `resume`). The session state is unchanged. |
++| `500` | Unexpected server error (see the server log). |
++
++- **Idempotency:** `GET`s are safe to repeat. Actions are *not* idempotent: repeating `pause` returns `409` because the cook is already paused. Use `available_actions` in the status to know what is legal.
++- **CORS:** no CORS headers are sent; the API is meant for scripts, not browser pages on other origins.
++
++---
++
++## Authentication
++
++Start the server with a token:
++
++```bash
++python3 app.py --api-token 'your-long-random-string'
++# or
++SOUSVIDE_API_TOKEN='your-long-random-string' python3 app.py
++```
++
++Every `/api/v1/*` request except `GET /api/v1/health` must then send one of:
++
++```
++Authorization: Bearer your-long-random-string
++X-API-Key: your-long-random-string
++```
++
++Without `--api-token`, `/api/v1/*` is open — exactly like the existing UI. The default bind address is still `127.0.0.1`, so nothing is reachable from the network until you pass `--host 0.0.0.0`.
++
++> **Important:** the token only protects `/api/v1/*`. The legacy UI endpoints (`/api/state`, `/api/settings`, `/api/session/*`, `/api/sim/*`) and the UI page are unchanged and stay open. If you expose the server beyond your own machine, put it on a trusted LAN/VPN or behind a reverse proxy, because anyone who can reach the legacy endpoints can also start a cook. This API can switch on a 750 W heater.
++
++Tokens are compared in constant time. Browser `EventSource` cannot send headers, so use `curl -N`, `fetch()` with a stream reader, or a Python/Node SSE client for `/stream`.
++
++---
++
++## The cook lifecycle
++
++Both the UI and the API move a single session through these phases (`cook.phase`):
++
++```
++        POST /cook                water_ok            (cooker found, setpoint written)
++ idle ───────────────▶ water ───────────▶ connect ─────────────────▶ armed
++                         │                   │                         │
++                         └──── cancel ───────┴──────────── cancel ─────┤
++                                                                       │ start  |  cooker_started
++                                                                       ▼
++ dismiss      stop                         food_in / dip detected   timer ends
++ ◀──── ended ◀──── (any live phase) ◀── preheat ──▶ ready ──────────▶ cook ─────────▶ done (overtime)
++```
++
++| Phase | Meaning | `available_actions` |
++|---|---|---|
++| `water` | Session created; waiting for you to put the stated litres in the pot. | `water_ok`, `cancel` |
++| `connect` | Scanning for / connecting to the cooker over Bluetooth, writing the target temperature. | `cancel` |
++| `armed` | Connected, setpoint written, waiting to be started. | `start`, `cooker_started`, `cancel` |
++| `preheat` | Heating the bath; `cook.preheat.eta_s` counts down. | `pause`/`resume`, `stop` |
++| `ready` | Bath is at temperature (a "ready" chime event repeats at `ready_reminder_s`). The cook timer starts when the bath temperature dips by `dip_threshold_c` (food added) or you call `food_in`. | `pause`/`resume`, `food_in`, `stop` |
++| `cook` | Timer running; `remaining_s` counts down. | `pause`/`resume`, `stop` |
++| `done` | Timer finished (`complete` event). `overtime_s` counts up. **The cooker keeps holding temperature**; the app never stops it by itself. | `pause`/`resume`, `stop` |
++| `ended` | Session over (`end_reason` says why). | `dismiss` |
++
++Notes:
++
++- No Bluetooth traffic exists while no cook is active. The connection is only opened for phases `connect` … `done`.
++- If the cooker disappears during `done` for longer than `unplug_end_s`, the session ends by itself with reason *"Cooker disconnected (unplugged?)"*.
++- A pause detected from the cooker's motor (someone pressed the button on the cooker) shows `paused: true` with `pause_source: "cooker"`; a pause from the UI or API shows `"ui"`.
++
++### Actions
++
++| Action | Allowed in | Effect |
++|---|---|---|
++| `water_ok` | `water` | Confirms the pot is filled; moves to `connect`. |
++| `start` | `armed` | **Sends *start* to the cooker** over Bluetooth and begins preheat. |
++| `cooker_started` | `armed` | You pressed start on the cooker yourself; begins preheat without sending a command. |
++| `pause` | live phases, not paused | **Sends *stop* to the cooker** and pauses the timers. |
++| `resume` | live phases, paused | **Sends *start* to the cooker** and resumes. |
++| `food_in` | `ready` | Starts the cook timer now, instead of waiting for the temperature dip. |
++| `stop` | live phases | Sends *stop* to the cooker (if connected), ends the session (`ended`, reason "Stopped"). |
++| `cancel` | `water`, `connect`, `armed` | Discards the session. Nothing was heating yet. |
++| `dismiss` | `ended` | Clears the finished session so a new cook can start. |
++
++---
++
++## Telemetry endpoints
++
++### `GET /api/v1/health`
++
++Liveness check. Never requires a token.
++
++```json
++{"ok": true, "api_version": "1.0", "simulator": false, "auth_required": true}
++```
++
++### `GET /api/v1/status`
++
++The one call a script usually needs: connection, current water temperature, and (if a cook exists) the whole cook state. Cheap to poll once per second.
++
++Example (during preheat, from the simulator):
++
++```json
++{
++  "api_version": "1.0",
++  "timestamp": "2026-11-02T04:35:49.002Z",
++  "simulator": true,
++  "connection": { "state": "connected", "connected": true, "message": null },
++  "cooker": {
++    "water_temp_c": 23.97,
++    "water_temp_f": 75.14,
++    "water_low": false,
++    "motor_speed": 1800,
++    "telemetry_age_s": 0.0
++  },
++  "last_event_id": 0,
++  "cook": {
++    "phase": "preheat",
++    "paused": false,
++    "pause_source": null,
++    "name": "Steak (Med-Rare)",
++    "emoji": "🥩",
++    "manual": false,
++    "frozen": false,
++    "pot": { "label": "8 qt", "range": "1–2 lb", "id": "small" },
++    "liters": 5.0,
++    "target_c": 54.5,
++    "target_f": 130.1,
++    "total_s": 5400,
++    "base_s": 5400,
++    "extra_s": 0,
++    "elapsed_s": 0.0,
++    "remaining_s": 5400.0,
++    "overtime_s": 0.0,
++    "cooker_link_lost": false,
++    "end_reason": null,
++    "session_s": 1090.7,
++    "auto_start_pending": false,
++    "available_actions": ["pause", "stop"],
++    "preheat": { "start_temp_c": 22.84, "eta_s": 1001, "eta_source": "model", "progress": 0.035, "duration_s": 37.9 },
++    "dip": null
++  },
++  "sim_speed": 300.0
++}
++```
++
++When idle: `"cook": null`, and `cooker.water_temp_c` is `null` (the app is not connected to the cooker, so it has no reading).
++
++Field details are in the [object reference](#object-reference).
++
++### `GET /api/v1/cook`
++
++Same `cook` object as in `/status`, on its own: `{"cook": {…}}` or `{"cook": null}`.
++
++### `GET /api/v1/stream`  (Server-Sent Events)
++
++A live feed. Query parameter `interval` (seconds, default `1`, clamped to `0.25 … 30`).
++
++Two event types:
++
++- `status` — data is exactly the `/status` object, sent every `interval` seconds, starting immediately.
++- `cook_event` — data is `{"id": 2, "type": "cookstart"}`; the SSE `id:` field equals the event id. Only events created *after* you connected are sent. These are the same events that make the touchscreen play its chimes (see [Events](#events)).
++
++```
++retry: 3000
++
++event: status
++data: {"api_version":"1.0","timestamp":"2026-11-02T04:35:54.137Z", … "cook":{"phase":"cook", …}}
++
++id: 3
++event: cook_event
++data: {"id":3,"type":"complete"}
++```
++
++```bash
++curl -N -H "$AUTH" "$SV/stream?interval=2"
++```
++
++### `GET /api/v1/events`
++
++Polling alternative to the stream. Returns the app's ring buffer of the last 30 events.
++
++Query: `after` (integer event id, default `0`) — only events with a higher id are returned.
++
++```json
++{ "events": [ {"id": 1, "type": "ready"}, {"id": 2, "type": "cookstart"} ], "last_event_id": 2 }
++```
++
++Reading events does not consume them; the UI is unaffected.
++
++#### Events
++
++| `type` | Raised when |
++|---|---|
++| `ready` | Bath reached target (and repeated every `ready_reminder_s` while waiting for food). |
++| `cookstart` | The cook timer started (dip detected or `food_in`). |
++| `complete` | The cook timer finished; overtime begins. |
++| `lowwater` | The cooker's low-water sensor is set (repeats at most every 8 s). |
++| `lost` | The Bluetooth link has been down for 30 s during a live phase (repeats at most once a minute). |
++
++### `GET /api/v1/history`
++
++Temperature log of the **current** session (sampled at most every 1.5 s) plus phase markers. Returns `404` when no cook exists; the log is discarded on `dismiss` — save it before then (see the [logging recipe](#log-a-cook-to-csv)).
++
++Query parameters:
++
++| Parameter | Default | Meaning |
++|---|---|---|
++| `since` | `-1` | Only samples with `t_s` greater than this (seconds since the session was created). Use the previous response's `next_since` for incremental reads. |
++| `max_points` | `0` (all) | Down-sample to about this many points (min 2). |
++| `format` | `json` | `json` or `csv`. |
++
++JSON:
++
++```json
++{
++  "session_started_at": "2026-11-02T04:34:34.802Z",
++  "name": "Steak (Med-Rare)",
++  "phase": "cook",
++  "columns": ["t_s", "temp_c"],
++  "samples": [[947.1, 23.463], [992.3, 23.434]],
++  "markers": [
++    {"t_s": 927.5, "kind": "armed"}, {"t_s": 1052.2, "kind": "start"},
++    {"t_s": 2079.1, "kind": "ready"}, {"t_s": 2305.2, "kind": "food"},
++    {"t_s": 2531.8, "kind": "recovered"}
++  ],
++  "next_since": 2985.5
++}
++```
++
++Marker kinds: `armed`, `start` (preheat began), `ready`, `food` (cook timer start; back-dated to when the bath began to fall), `recovered` (bath back at target after the food dip), `done`, `end`.
++
++CSV (`?format=csv`): header `t_s,timestamp,temp_c`, one row per sample.
++
++---
++
++## Cook control endpoints
++
++### `POST /api/v1/cook` — start a cook
++
++Creates the session. Only one cook can exist at a time (`409` otherwise; `dismiss` or `cancel` the old one first).
++
++Body — give **exactly one** of `preset` or `manual`:
++
++| Field | Type | Required | Description |
++|---|---|---|---|
++| `pot` | string | yes | Pot id (`small`, `medium`, `large`) or its label as currently configured (e.g. `"8 qt"`; case-insensitive). Sets the default water volume. |
++| `preset` | string | one of | A preset id (`f1`…`f12`) or its exact name (case-insensitive, e.g. `"Pork Chops"`). Empty slots are rejected. |
++| `frozen` | bool | no | With `preset`: add the preset's `frozen_extra_min` to the cook time. Default `false`. |
++| `manual` | object | one of | `{"temp_c": 63, "time_min": 45, "liters": 6.5}`. `temp_c` 20–92, `time_min` 1–4320 (72 h). `liters` optional (0.5–30; defaults to the pot's volume). |
++| `confirm_water` | bool | no | Also performs `water_ok`: you assert the pot already holds the right amount of water. Default `false`. |
++| `auto_start` | bool | no | After the cooker is found and armed, automatically perform `start`. Requires `confirm_water: true`. Default `false`. |
++
++Water volume for a preset is the preset's per-pot override (`liters.<pot>`) if set, otherwise the pot's default. This is the number the UI tells you to dispense, and it drives the preheat ETA model.
++
++Response `201`:
++
++```json
++{ "ok": true, "status": { …same as GET /status… } }
++```
++
++Examples:
++
++```bash
++# Interactive-style: create, then confirm and start yourself later
++curl -H "$AUTH" -H 'Content-Type: application/json' -X POST $SV/cook \
++     -d '{"preset":"f1","pot":"small"}'
++
++# Manual 63 °C / 45 min soft egg in the 12 qt pot, water already in
++curl -H "$AUTH" -H 'Content-Type: application/json' -X POST $SV/cook \
++     -d '{"manual":{"temp_c":63,"time_min":45},"pot":"medium","confirm_water":true}'
++
++# Fully hands-free frozen steak
++curl -H "$AUTH" -H 'Content-Type: application/json' -X POST $SV/cook \
++     -d '{"preset":"Steak (Med-Rare)","pot":"8 qt","frozen":true,"confirm_water":true,"auto_start":true}'
++```
++
++> **Safety:** `confirm_water` and `auto_start` are *your* statement that the pot is filled and the cooker is clamped in and plugged in. With `auto_start` nothing asks a person before the heater turns on. The cooker's low-water sensor still raises `lowwater` events, but the app cannot prevent dry running. `auto_start` waits up to 15 minutes for the cooker to be found; if it fails to send *start*, the session stays `armed` and you (or the touchscreen) can still start it. The status shows `auto_start_pending: true` while it is waiting.
++
++Errors: `409` cook already in progress; `422` bad/missing fields; `400` value out of range (manual).
++
++### `POST /api/v1/cook/actions/{action}`
++
++Performs one of the [actions](#actions). No body. Returns `200`:
++
++```json
++{ "ok": true, "action": "food_in", "status": { …same as GET /status… } }
++```
++
++`409` if the action is not allowed in the current phase (check `cook.available_actions`) or no cook exists; `404` for an unknown action name; `502` if the cooker did not accept `start`/`pause`/`resume`.
++
++`start` waits for the cooker's reply, so it takes a moment. `water_ok` returns immediately; the connection then happens in the background — poll `/status` until `phase` is `armed` before calling `start` (or use `auto_start`).
++
++---
++
++## Settings endpoints
++
++Settings are the same data the UI's settings page edits, stored in `data/settings.json`. Changes take effect immediately and persist across restarts.
++
++> Changing presets, pots, or the physical constants affects **future** cooks. A cook already in progress keeps the temperature, time and volume it started with. The `volume` and detection/chime thresholds (`ready_*`, `dip_*`, `unplug_*`, `detect_pause_from_motor`) are read live.
++
++### `GET /api/v1/settings`
++
++Returns the full settings object:
++
++```json
++{
++  "pots": [ {"id": "small", "label": "8 qt", "range": "1–2 lb", "liters": 5.0}, … ],
++  "foods": [
++    { "id": "f1", "name": "Chicken Breast", "emoji": "🐔", "temp_c": 65.0,
++      "time_min": 90, "frozen_extra_min": 45,
++      "liters": {"small": null, "medium": null, "large": null} },
++    …
++  ],
++  "power_w": 750, "efficiency": 0.85,
++  "dip_threshold_c": 1.0, "ready_tol_c": 0.2, "ready_reminder_s": 60,
++  "unplug_end_s": 120, "detect_pause_from_motor": true, "volume": 0.7
++}
++```
++
++### `PATCH /api/v1/settings` — partial update (recommended)
++
++Send only what you want to change. Anything you leave out is untouched.
++
++- Top-level scalars: set directly.
++- `pots` and `foods`: lists of partial objects, each identified by `id`; only the fields you send change. For `foods[].liters`, only the pot keys you send change; send `null` to clear one.
++- Unknown fields, unknown ids, or wrong types are rejected with `422` and nothing is saved.
++- Valid values outside the allowed range are **clamped** (same as the UI); the response is the resulting settings so you can see what was stored.
++
++```bash
++curl -H "$AUTH" -H 'Content-Type: application/json' -X PATCH $SV/settings -d '{
++  "volume": 0.4,
++  "pots":  [ {"id": "medium", "liters": 8.5} ],
++  "foods": [ {"id": "f3", "temp_c": 55.5, "time_min": 120, "liters": {"small": 4.5}} ]
++}'
++```
++
++### `PUT /api/v1/settings` — full replace
++
++Same semantics as the UI's save: the body is run through the sanitiser, and **any field you omit is reset to its factory default**. Use `PATCH` unless you are restoring a complete backup (`GET` → store → `PUT`).
++
++### Presets
++
++Twelve slots, `f1` … `f12`. A slot with an empty `name` is blank (and cannot be started).
++
++| Request | Description |
++|---|---|
++| `GET /api/v1/presets` | `{"presets": [ … ]}` — every slot, each with `slot` (1–12) and `empty` added. |
++| `GET /api/v1/presets/{id}` | One preset. |
++| `PATCH /api/v1/presets/{id}` | Partial update of one preset; returns it. To blank a slot, set `"name": ""`. |
++
++```bash
++curl -H "$AUTH" -H 'Content-Type: application/json' -X PATCH $SV/presets/f11 \
++     -d '{"name":"Lamb Chops","emoji":"🐑","temp_c":57,"time_min":120,"frozen_extra_min":60}'
++```
++
++### Pots
++
++| Request | Description |
++|---|---|
++| `GET /api/v1/pots` | `{"pots": [ … ]}` |
++| `PATCH /api/v1/pots/{id}` | `id` is `small`, `medium` or `large`. Fields: `label`, `range`, `liters`. Returns the pot. |
++
++### Setting limits
++
++Values are clamped into these ranges:
++
++| Field | Range | Notes |
++|---|---|---|
++| `pots[].label` | ≤ 12 chars | |
++| `pots[].range` | ≤ 16 chars | Display text only. |
++| `pots[].liters` | 0.5 – 30 | |
++| `foods[].name` | ≤ 24 chars | Empty = blank slot. |
++| `foods[].emoji` | ≤ 8 chars | |
++| `foods[].temp_c` | 20 – 92 | |
++| `foods[].time_min` | 1 – 4320 | |
++| `foods[].frozen_extra_min` | 0 – 4320 | |
++| `foods[].liters.<pot>` | 0.5 – 30, or `null` | `null` / `0` = use the pot's default. |
++| `power_w` | 100 – 3000 | Heater power used by the preheat ETA model. |
++| `efficiency` | 0.3 – 1.0 | Fraction of power that heats the bath. |
++| `dip_threshold_c` | 0.3 – 10 | Drop below target that means "food went in". |
++| `ready_tol_c` | 0.05 – 2 | Within this of target counts as at temperature. |
++| `ready_reminder_s` | 0 – 600 | Repeat the `ready` event; `0` = once. |
++| `unplug_end_s` | 30 – 1800 | Overtime + no Bluetooth this long ⇒ session ends. |
++| `detect_pause_from_motor` | bool | Treat the cooker's motor stopping as a pause. |
++| `volume` | 0 – 1 | UI chime volume. |
++
++---
++
++## Simulator endpoints
++
++### `POST /api/v1/sim/{name}`
++
++Only meaningful when the server was started with `--sim`; otherwise `404`. `name` is one of:
++
++| `name` | Effect |
++|---|---|
++| `food` | Drops a cold 1 kg item into the simulated bath (triggers the dip detection). |
++| `lowwater` / `refill` | Sets / clears the low-water sensor. |
++| `unplug` | Simulates the cooker disappearing from Bluetooth. |
++
++Returns `{"ok": true, "sim_action": "food"}`. This lets you test scripts end-to-end without hardware: `python3 app.py --sim --speed 120`.
++
++---
++
++## Object reference
++
++### Status object (`GET /status`, `/stream`, action responses)
++
++| Field | Type | Description |
++|---|---|---|
++| `api_version` | string | `"1.0"` |
++| `timestamp` | string | When this snapshot was taken (UTC). |
++| `simulator` | bool | `true` when run with `--sim`. |
++| `sim_speed` | number | Only present in simulator mode: time multiplier. |
++| `connection.state` | string | `idle` (no cook needs Bluetooth), `scanning`, `reconnecting`, `connected`. |
++| `connection.connected` | bool | Bluetooth link is up right now. |
++| `connection.message` | string \| null | Latest connection problem in plain words. |
++| `cooker.water_temp_c` / `_f` | number \| null | Latest bath temperature; `null` when not connected. |
++| `cooker.water_low` | bool | Low-water sensor. |
++| `cooker.motor_speed` | number \| null | Raw motor-speed sensor from the cooker (`0` = stopped). |
++| `cooker.telemetry_age_s` | number \| null | Seconds since the last successful reading (`null` = none yet). A growing value means the link is stale. |
++| `last_event_id` | integer | Id of the newest [event](#events); compare with your last seen id. |
++| `cook` | object \| null | See below; `null` when no session exists. |
++
++### Cook object
++
++| Field | Type | Description |
++|---|---|---|
++| `phase` | string | See the [lifecycle](#the-cook-lifecycle). |
++| `paused` | bool | Timers and ETA frozen. |
++| `pause_source` | `"ui"` \| `"cooker"` \| null | Who paused (UI/API vs. the cooker's own button). |
++| `name`, `emoji` | string | Preset name/emoji, or `"Manual"`. |
++| `manual` | bool | Started with a `manual` body. |
++| `frozen` | bool | Frozen extra time included. |
++| `pot` | object | `{id, label, range}` of the selected pot. |
++| `liters` | number | Water volume for this cook. |
++| `target_c`, `target_f` | number | Setpoint. |
++| `base_s`, `extra_s`, `total_s` | number | Cook time, frozen extra, and their sum. |
++| `elapsed_s` | number | Time on the cook timer (keeps counting in overtime). |
++| `remaining_s` | number | `max(0, total_s - elapsed_s)`. |
++| `overtime_s` | number | `max(0, elapsed_s - total_s)`. |
++| `cooker_link_lost` | bool | In a live phase while Bluetooth is down. |
++| `end_reason` | string \| null | Set in `ended`. |
++| `session_s` | number | Seconds since the session was created (frozen at the end). |
++| `auto_start_pending` | bool | A script-requested `auto_start` is still waiting. |
++| `available_actions` | string[] | Actions that will currently succeed. |
++| `preheat` | object \| null | Present once heating began: `start_temp_c`, `eta_s` (seconds until target; recomputed every minute), `eta_source` (`model` from power/volume, `measured` once the real heating rate is known), `progress` (0–1), `duration_s` (preheat length so far, or total once finished). |
++| `dip` | object \| null | Present after food was detected by temperature dip: `active` (still recovering), `low_c` (lowest temp), `depth_c` (target − low), `recovery_s` (time from the fall start until back at target), `low_after_s` (time to the minimum). |
++
++---
++
++## Recipes
++
++### Start a cook, wait for it to be ready, then notify
++
++```python
++import json, os, time, urllib.request
++
++BASE = "http://127.0.0.1:8080/api/v1"
++TOKEN = os.environ.get("SOUSVIDE_API_TOKEN")
++
++def call(method, path, body=None):
++    req = urllib.request.Request(BASE + path, method=method,
++        data=None if body is None else json.dumps(body).encode(),
++        headers={"Content-Type": "application/json",
++                 **({"Authorization": f"Bearer {TOKEN}"} if TOKEN else {})})
++    with urllib.request.urlopen(req) as r:
++        return json.load(r)
++
++call("POST", "/cook", {"preset": "Salmon", "pot": "small",
++                       "confirm_water": True, "auto_start": True})
++
++while (cook := call("GET", "/status")["cook"])["phase"] != "ready":
++    time.sleep(5)
++print("Bath is ready — add the food!")
++```
++
++### Follow live events with `curl`
++
++`cook_event` payloads start with `{"id"`, status payloads with `{"api_version"`, so a plain filter is enough:
++
++```bash
++curl -sN -H "$AUTH" $SV/stream \
++  | grep --line-buffered '^data: {"id"' | sed -u 's/^data: //' \
++  | jq --unbuffered -r '"chime: " + .type'
++```
++
++### Log a cook to CSV
++
++```bash
++python3 examples/svctl.py log cook.csv     # polls /history?since=… every 5 s until the cook is dismissed
++```
++
++or one shot, before dismissing: `curl -H "$AUTH" "$SV/history?format=csv" > cook.csv`.
++
++### Change a preset from a script
++
++```bash
++curl -s -H "$AUTH" -H 'Content-Type: application/json' -X PATCH $SV/presets/f1 -d '{"time_min": 105}'
++```
++
++### Home Assistant (REST sensor)
++
++```yaml
++sensor:
++  - platform: rest
++    name: Sous vide water temp
++    resource: http://sousvide.local:8080/api/v1/status
++    headers: { Authorization: "Bearer YOUR_TOKEN" }
++    value_template: "{{ value_json.cooker.water_temp_c }}"
++    unit_of_measurement: "°C"
++    json_attributes_path: "$.cook"
++    json_attributes: [phase, remaining_s, available_actions]
++    scan_interval: 10
++```
++
++---
++
++## Legacy UI endpoints
++
++These are what `index.html` uses. They are unchanged and unauthenticated; prefer `/api/v1/` for scripts.
++
++| Request | Description |
++|---|---|
++| `GET /` | The touchscreen UI (`index.html`). |
++| `GET /api/state` | UI snapshot: `sim`, `speed`, `conn`, `tel`, `events` (last 20), `last_event_id`, `volume`, and `session` (cook state plus `chart` and `dip_chart` point arrays, and `pre` / `dip` sub-objects). Temperatures in °C, durations in seconds. |
++| `GET /api/settings` | Settings object (same as `GET /api/v1/settings`). |
++| `PUT /api/settings` | Full replace (omitted fields reset to defaults). Same as `PUT /api/v1/settings` but malformed JSON is rejected with `400`. |
++| `POST /api/session/start` | Body `{"food_id": "f3", "pot": "small", "frozen": false}` or `{"pot": "small", "manual": {"temp_c": 63, "time_min": 45, "liters": null}}`. Returns `{"ok": true}`. `409` if a cook exists. Does **not** confirm the water; follow with `water_ok`. |
++| `POST /api/session/action` | Body `{"action": "water_ok"}` (any [action](#actions)). Returns `{"ok": true}`; `409` if not allowed; `502` on cooker command failure. |
++| `POST /api/sim/{name}` | Simulator hooks (`food`, `lowwater`, `refill`, `unplug`). |
++
++---
++
++## Behavior notes and caveats
++
++- **One cook at a time.** The engine holds a single session. A second `POST /cook` gets `409`.
++- **Polling cost.** `/status` is computed from in-memory state and does not talk to the cooker, so polling it never adds Bluetooth traffic. The app itself polls the cooker every ~2 s while a cook is live and not at all when idle.
++- **`water_temp_c` is `null` while idle** by design: with no cook, there is no Bluetooth connection and therefore no reading.
++- **Event ring.** Only the last 30 events are kept, and events have no timestamps. Use `/stream`, or poll `/events?after=<last id>` more often than events can occur (a few per cook).
++- **History is per session.** `/history` covers the current session only (including the preheat and the food-dip waveform) and is gone after `dismiss`.
++- **The app never turns the cooker off by itself.** After `done`, the cooker keeps holding temperature until you call `stop` (or unplug it). `pause` and `stop` are the only actions that send a stop command.
++- **Settings clamp rather than fail** for out-of-range numbers (as the UI does); wrong types and unknown fields do fail (`422`).
++- **Time in the simulator.** With `--speed N`, all durations and timestamps in `status`/`history` run N× faster than wall-clock; real-time `interval`s on `/stream` are unaffected.
++- **Security** — see [Authentication](#authentication): the token covers `/api/v1/*` only.
+diff --git a/docs/openapi.yaml b/docs/openapi.yaml
+new file mode 100644
+index 0000000..0285827
+--- /dev/null
++++ b/docs/openapi.yaml
+@@ -0,0 +1,473 @@
++openapi: 3.0.3
++info:
++  title: Sous Vide Assistant API
++  version: "1.0"
++  description: |
++    Scripting API for the Sous Vide Assistant (Anova Precision Cooker Nano).
++    Temperatures are degrees C, durations are seconds (`*_s`), except preset/manual
++    cook times which are minutes (`*_min`). Full prose documentation: docs/API.md.
++servers:
++  - url: http://127.0.0.1:8080/api/v1
++security:
++  - bearerAuth: []
++  - apiKeyAuth: []
++  - {}
++tags:
++  - name: Telemetry
++  - name: Cook control
++  - name: Settings
++  - name: Simulator
++paths:
++  /health:
++    get:
++      tags: [Telemetry]
++      summary: Liveness check (never needs a token)
++      security: []
++      responses:
++        "200":
++          description: OK
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok: {type: boolean}
++                  api_version: {type: string}
++                  simulator: {type: boolean}
++                  auth_required: {type: boolean}
++  /status:
++    get:
++      tags: [Telemetry]
++      summary: Connection, water temperature and full cook state
++      responses:
++        "200": {description: Current status, content: {application/json: {schema: {$ref: "#/components/schemas/Status"}}}}
++        "401": {$ref: "#/components/responses/Error"}
++  /stream:
++    get:
++      tags: [Telemetry]
++      summary: Server-Sent Events - `status` snapshots and `cook_event` chimes
++      parameters:
++        - {name: interval, in: query, schema: {type: number, default: 1, minimum: 0.25, maximum: 30}, description: Seconds between `status` events}
++      responses:
++        "200":
++          description: |
++            text/event-stream. Event `status` carries a Status object; event `cook_event`
++            carries an Event object (SSE `id:` = event id).
++          content:
++            text/event-stream:
++              schema: {type: string}
++  /events:
++    get:
++      tags: [Telemetry]
++      summary: Recent chime events (ring buffer of 30)
++      parameters:
++        - {name: after, in: query, schema: {type: integer, default: 0}, description: Only events with a higher id}
++      responses:
++        "200":
++          description: Events
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  events: {type: array, items: {$ref: "#/components/schemas/Event"}}
++                  last_event_id: {type: integer}
++        "400": {$ref: "#/components/responses/Error"}
++  /history:
++    get:
++      tags: [Telemetry]
++      summary: Temperature log and phase markers of the current session
++      parameters:
++        - {name: since, in: query, schema: {type: number, default: -1}, description: Only samples with t_s greater than this}
++        - {name: max_points, in: query, schema: {type: integer, default: 0}, description: Down-sample to about this many points}
++        - {name: format, in: query, schema: {type: string, enum: [json, csv], default: json}}
++      responses:
++        "200":
++          description: History
++          content:
++            application/json:
++              schema: {$ref: "#/components/schemas/History"}
++            text/csv:
++              schema: {type: string, example: "t_s,timestamp,temp_c\n947.1,2026-11-02T04:34:37.959Z,23.463\n"}
++        "404": {$ref: "#/components/responses/Error"}
++  /cook:
++    get:
++      tags: [Cook control]
++      summary: Current cook (or null)
++      responses:
++        "200":
++          description: Cook
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  cook: {nullable: true, allOf: [{$ref: "#/components/schemas/Cook"}]}
++    post:
++      tags: [Cook control]
++      summary: Start a cook (preset or manual)
++      description: |
++        Provide exactly one of `preset` or `manual`. `auto_start` requires `confirm_water`.
++        With `auto_start` the heater turns on without a person pressing anything.
++      requestBody:
++        required: true
++        content:
++          application/json:
++            schema: {$ref: "#/components/schemas/StartCook"}
++            examples:
++              preset:
++                value: {preset: Chicken Breast, pot: small, frozen: false, confirm_water: true, auto_start: true}
++              manual:
++                value: {manual: {temp_c: 63, time_min: 45}, pot: medium, confirm_water: true}
++      responses:
++        "201":
++          description: Cook created
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok: {type: boolean}
++                  status: {$ref: "#/components/schemas/Status"}
++        "400": {$ref: "#/components/responses/Error"}
++        "409": {$ref: "#/components/responses/Error"}
++        "422": {$ref: "#/components/responses/Error"}
++  /cook/actions/{action}:
++    post:
++      tags: [Cook control]
++      summary: Perform a cook action
++      description: Check `cook.available_actions` in the status for what is allowed now.
++      parameters:
++        - name: action
++          in: path
++          required: true
++          schema: {$ref: "#/components/schemas/ActionName"}
++      responses:
++        "200":
++          description: Action performed
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok: {type: boolean}
++                  action: {type: string}
++                  status: {$ref: "#/components/schemas/Status"}
++        "404": {$ref: "#/components/responses/Error"}
++        "409": {$ref: "#/components/responses/Error"}
++        "502": {$ref: "#/components/responses/Error"}
++  /settings:
++    get:
++      tags: [Settings]
++      summary: Full settings
++      responses:
++        "200": {description: Settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
++    put:
++      tags: [Settings]
++      summary: Replace settings (omitted fields reset to factory defaults)
++      requestBody:
++        required: true
++        content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}
++      responses:
++        "200": {description: Stored settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
++        "400": {$ref: "#/components/responses/Error"}
++    patch:
++      tags: [Settings]
++      summary: Partial update (pots/foods entries are matched by id)
++      requestBody:
++        required: true
++        content: {application/json: {schema: {$ref: "#/components/schemas/SettingsPatch"}}}
++      responses:
++        "200": {description: Stored settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
++        "400": {$ref: "#/components/responses/Error"}
++        "422": {$ref: "#/components/responses/Error"}
++  /presets:
++    get:
++      tags: [Settings]
++      summary: All 12 preset slots
++      responses:
++        "200":
++          description: Presets
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  presets: {type: array, items: {$ref: "#/components/schemas/PresetView"}}
++  /presets/{id}:
++    parameters:
++      - {name: id, in: path, required: true, schema: {type: string, example: f3}}
++    get:
++      tags: [Settings]
++      summary: One preset
++      responses:
++        "200": {description: Preset, content: {application/json: {schema: {$ref: "#/components/schemas/PresetView"}}}}
++        "404": {$ref: "#/components/responses/Error"}
++    patch:
++      tags: [Settings]
++      summary: Partial update of one preset (set name "" to blank the slot)
++      requestBody:
++        required: true
++        content: {application/json: {schema: {$ref: "#/components/schemas/PresetPatch"}}}
++      responses:
++        "200": {description: Updated preset, content: {application/json: {schema: {$ref: "#/components/schemas/PresetView"}}}}
++        "404": {$ref: "#/components/responses/Error"}
++        "422": {$ref: "#/components/responses/Error"}
++  /pots:
++    get:
++      tags: [Settings]
++      summary: The three pots
++      responses:
++        "200":
++          description: Pots
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  pots: {type: array, items: {$ref: "#/components/schemas/Pot"}}
++  /pots/{id}:
++    patch:
++      tags: [Settings]
++      summary: Partial update of one pot
++      parameters:
++        - {name: id, in: path, required: true, schema: {type: string, enum: [small, medium, large]}}
++      requestBody:
++        required: true
++        content: {application/json: {schema: {$ref: "#/components/schemas/PotPatch"}}}
++      responses:
++        "200": {description: Updated pot, content: {application/json: {schema: {$ref: "#/components/schemas/Pot"}}}}
++        "404": {$ref: "#/components/responses/Error"}
++        "422": {$ref: "#/components/responses/Error"}
++  /sim/{name}:
++    post:
++      tags: [Simulator]
++      summary: Simulator hook (404 unless the server runs with --sim)
++      parameters:
++        - {name: name, in: path, required: true, schema: {type: string, enum: [food, lowwater, refill, unplug]}}
++      responses:
++        "200":
++          description: Done
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  ok: {type: boolean}
++                  sim_action: {type: string}
++        "404": {$ref: "#/components/responses/Error"}
++components:
++  securitySchemes:
++    bearerAuth: {type: http, scheme: bearer}
++    apiKeyAuth: {type: apiKey, in: header, name: X-API-Key}
++  responses:
++    Error:
++      description: Error
++      content:
++        application/json:
++          schema: {$ref: "#/components/schemas/Error"}
++  schemas:
++    Error:
++      type: object
++      properties:
++        error: {type: string}
++      required: [error]
++    ActionName:
++      type: string
++      enum: [water_ok, start, cooker_started, pause, resume, food_in, stop, cancel, dismiss]
++    Phase:
++      type: string
++      enum: [water, connect, armed, preheat, ready, cook, done, ended]
++    Event:
++      type: object
++      properties:
++        id: {type: integer}
++        type: {type: string, enum: [ready, cookstart, complete, lowwater, lost]}
++    Pot:
++      type: object
++      properties:
++        id: {type: string, enum: [small, medium, large]}
++        label: {type: string, maxLength: 12}
++        range: {type: string, maxLength: 16}
++        liters: {type: number, minimum: 0.5, maximum: 30}
++    PotPatch:
++      type: object
++      additionalProperties: false
++      properties:
++        id: {type: string}
++        label: {type: string}
++        range: {type: string}
++        liters: {type: number}
++    PotLiters:
++      type: object
++      additionalProperties: false
++      properties:
++        small: {type: number, nullable: true}
++        medium: {type: number, nullable: true}
++        large: {type: number, nullable: true}
++    Preset:
++      type: object
++      properties:
++        id: {type: string, example: f1}
++        name: {type: string, maxLength: 24}
++        emoji: {type: string, maxLength: 8}
++        temp_c: {type: number, minimum: 20, maximum: 92}
++        time_min: {type: integer, minimum: 1, maximum: 4320}
++        frozen_extra_min: {type: integer, minimum: 0, maximum: 4320}
++        liters: {$ref: "#/components/schemas/PotLiters"}
++    PresetView:
++      allOf:
++        - $ref: "#/components/schemas/Preset"
++        - type: object
++          properties:
++            slot: {type: integer, minimum: 1, maximum: 12}
++            empty: {type: boolean}
++    PresetPatch:
++      type: object
++      additionalProperties: false
++      properties:
++        id: {type: string}
++        name: {type: string}
++        emoji: {type: string}
++        temp_c: {type: number}
++        time_min: {type: number}
++        frozen_extra_min: {type: number}
++        liters: {$ref: "#/components/schemas/PotLiters"}
++    Settings:
++      type: object
++      properties:
++        pots: {type: array, items: {$ref: "#/components/schemas/Pot"}}
++        foods: {type: array, items: {$ref: "#/components/schemas/Preset"}}
++        power_w: {type: integer, minimum: 100, maximum: 3000}
++        efficiency: {type: number, minimum: 0.3, maximum: 1}
++        dip_threshold_c: {type: number, minimum: 0.3, maximum: 10}
++        ready_tol_c: {type: number, minimum: 0.05, maximum: 2}
++        ready_reminder_s: {type: integer, minimum: 0, maximum: 600}
++        unplug_end_s: {type: integer, minimum: 30, maximum: 1800}
++        detect_pause_from_motor: {type: boolean}
++        volume: {type: number, minimum: 0, maximum: 1}
++    SettingsPatch:
++      type: object
++      additionalProperties: false
++      properties:
++        pots: {type: array, items: {$ref: "#/components/schemas/PotPatch"}}
++        foods: {type: array, items: {$ref: "#/components/schemas/PresetPatch"}}
++        power_w: {type: number}
++        efficiency: {type: number}
++        dip_threshold_c: {type: number}
++        ready_tol_c: {type: number}
++        ready_reminder_s: {type: number}
++        unplug_end_s: {type: number}
++        detect_pause_from_motor: {type: boolean}
++        volume: {type: number}
++    StartCook:
++      type: object
++      additionalProperties: false
++      required: [pot]
++      properties:
++        pot: {type: string, description: "Pot id (small/medium/large) or its label, e.g. \"8 qt\""}
++        preset: {type: string, description: Preset id (f1..f12) or exact name}
++        frozen: {type: boolean, default: false}
++        manual:
++          type: object
++          additionalProperties: false
++          required: [temp_c, time_min]
++          properties:
++            temp_c: {type: number, minimum: 20, maximum: 92}
++            time_min: {type: number, minimum: 1, maximum: 4320}
++            liters: {type: number, minimum: 0.5, maximum: 30}
++        confirm_water: {type: boolean, default: false}
++        auto_start: {type: boolean, default: false, description: Requires confirm_water}
++    Preheat:
++      type: object
++      properties:
++        start_temp_c: {type: number}
++        eta_s: {type: number, nullable: true}
++        eta_source: {type: string, enum: [model, measured]}
++        progress: {type: number, minimum: 0, maximum: 1}
++        duration_s: {type: number}
++    Dip:
++      type: object
++      properties:
++        active: {type: boolean}
++        low_c: {type: number}
++        depth_c: {type: number}
++        recovery_s: {type: number}
++        low_after_s: {type: number}
++    Cook:
++      type: object
++      properties:
++        phase: {$ref: "#/components/schemas/Phase"}
++        paused: {type: boolean}
++        pause_source: {type: string, enum: [ui, cooker], nullable: true}
++        name: {type: string}
++        emoji: {type: string}
++        manual: {type: boolean}
++        frozen: {type: boolean}
++        pot:
++          type: object
++          properties:
++            id: {type: string}
++            label: {type: string}
++            range: {type: string}
++        liters: {type: number}
++        target_c: {type: number}
++        target_f: {type: number}
++        total_s: {type: number}
++        base_s: {type: number}
++        extra_s: {type: number}
++        elapsed_s: {type: number}
++        remaining_s: {type: number}
++        overtime_s: {type: number}
++        cooker_link_lost: {type: boolean}
++        end_reason: {type: string, nullable: true}
++        session_s: {type: number}
++        auto_start_pending: {type: boolean}
++        available_actions: {type: array, items: {$ref: "#/components/schemas/ActionName"}}
++        preheat: {nullable: true, allOf: [{$ref: "#/components/schemas/Preheat"}]}
++        dip: {nullable: true, allOf: [{$ref: "#/components/schemas/Dip"}]}
++    Status:
++      type: object
++      properties:
++        api_version: {type: string}
++        timestamp: {type: string, format: date-time}
++        simulator: {type: boolean}
++        sim_speed: {type: number}
++        connection:
++          type: object
++          properties:
++            state: {type: string, enum: [idle, scanning, reconnecting, connected]}
++            connected: {type: boolean}
++            message: {type: string, nullable: true}
++        cooker:
++          type: object
++          properties:
++            water_temp_c: {type: number, nullable: true}
++            water_temp_f: {type: number, nullable: true}
++            water_low: {type: boolean}
++            motor_speed: {type: number, nullable: true}
++            telemetry_age_s: {type: number, nullable: true}
++        last_event_id: {type: integer}
++        cook: {nullable: true, allOf: [{$ref: "#/components/schemas/Cook"}]}
++    History:
++      type: object
++      properties:
++        session_started_at: {type: string, format: date-time}
++        name: {type: string}
++        phase: {$ref: "#/components/schemas/Phase"}
++        columns: {type: array, items: {type: string}, example: [t_s, temp_c]}
++        samples:
++          type: array
++          items:
++            type: array
++            minItems: 2
++            maxItems: 2
++            items: {type: number}
++        markers:
++          type: array
++          items:
++            type: object
++            properties:
++              t_s: {type: number}
++              kind: {type: string, enum: [armed, start, ready, food, recovered, done, end]}
++        next_since: {type: number}
+diff --git a/examples/svctl.py b/examples/svctl.py
+new file mode 100755
+index 0000000..651b74e
+--- /dev/null
++++ b/examples/svctl.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++"""
++svctl - tiny command-line client for the Sous Vide Assistant scripting API.
++Standard library only.
++
++  export SOUSVIDE_URL=http://192.168.1.50:8080     # default http://127.0.0.1:8080
++  export SOUSVIDE_API_TOKEN=...                    # only if the server uses --api-token
++
++  svctl.py status                       one-line summary (add --json for the raw object)
++  svctl.py watch                        live stream (status + chime events)
++  svctl.py start "Chicken Breast" --pot small --water-ok --auto-start
++  svctl.py start --manual 63 45 --pot medium --water-ok
++  svctl.py act food_in                  water_ok|start|cooker_started|pause|resume|food_in|stop|cancel|dismiss
++  svctl.py log temps.csv                append temperature samples until the cook is dismissed (Ctrl-C to quit)
++  svctl.py settings                     print settings JSON
++  svctl.py set volume=0.5 power_w=750   change global settings
++  svctl.py preset f3 time_min=100 temp_c=55
++"""
++import argparse, json, os, sys, time, urllib.error, urllib.request
++
++BASE = os.environ.get("SOUSVIDE_URL", "http://127.0.0.1:8080").rstrip("/") + "/api/v1"
++TOKEN = os.environ.get("SOUSVIDE_API_TOKEN")
++
++
++def req(method, path, body=None, stream=False):
++    r = urllib.request.Request(BASE + path, method=method,
++                               data=None if body is None else json.dumps(body).encode(),
++                               headers={"Content-Type": "application/json"})
++    if TOKEN:
++        r.add_header("Authorization", f"Bearer {TOKEN}")
++    try:
++        resp = urllib.request.urlopen(r, timeout=None if stream else 15)
++    except urllib.error.HTTPError as e:
++        try:
++            msg = json.loads(e.read().decode()).get("error", e.reason)
++        except Exception:
++            msg = e.reason
++        sys.exit(f"error {e.code}: {msg}")
++    except urllib.error.URLError as e:
++        sys.exit(f"cannot reach {BASE}: {e.reason}")
++    return resp if stream else json.loads(resp.read().decode() or "{}")
++
++
++def mmss(s):
++    s = int(s or 0)
++    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
++
++
++def line(st):
++    c, k = st["cook"], st["cooker"]
++    t = "--" if k["water_temp_c"] is None else f"{k['water_temp_c']:.1f}C"
++    if not c:
++        return f"idle  water {t}  link {st['connection']['state']}"
++    extra = ""
++    if c["phase"] == "preheat" and c["preheat"] and c["preheat"]["eta_s"] is not None:
++        extra = f"  eta {mmss(c['preheat']['eta_s'])} ({c['preheat']['eta_source']})"
++    elif c["phase"] == "cook":
++        extra = f"  left {mmss(c['remaining_s'])}"
++    elif c["phase"] == "done":
++        extra = f"  overtime +{mmss(c['overtime_s'])}"
++    pause = " PAUSED" if c["paused"] else ""
++    return (f"{c['phase']}{pause}  {c['name']}  water {t} -> {c['target_c']}C{extra}"
++            f"  [{', '.join(c['available_actions'])}]")
++
++
++def kv(items):
++    out = {}
++    for it in items:
++        k, _, v = it.partition("=")
++        try:
++            out[k] = json.loads(v)
++        except ValueError:
++            out[k] = v
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    p = sub.add_parser("status"); p.add_argument("--json", action="store_true")
++    sub.add_parser("watch")
++    p = sub.add_parser("start")
++    p.add_argument("preset", nargs="?"); p.add_argument("--manual", nargs=2, metavar=("TEMP_C", "MINUTES"), type=float)
++    p.add_argument("--liters", type=float); p.add_argument("--pot", required=True)
++    p.add_argument("--frozen", action="store_true"); p.add_argument("--water-ok", action="store_true")
++    p.add_argument("--auto-start", action="store_true")
++    p = sub.add_parser("act"); p.add_argument("action")
++    p = sub.add_parser("log"); p.add_argument("file")
++    sub.add_parser("settings")
++    p = sub.add_parser("set"); p.add_argument("pairs", nargs="+")
++    p = sub.add_parser("preset"); p.add_argument("id"); p.add_argument("pairs", nargs="*")
++    a = ap.parse_args()
++
++    if a.cmd == "status":
++        st = req("GET", "/status")
++        print(json.dumps(st, indent=2) if a.json else line(st))
++    elif a.cmd == "watch":
++        resp = req("GET", "/stream", stream=True)
++        ev = None
++        for raw in resp:
++            raw = raw.decode().rstrip("\n")
++            if raw.startswith("event:"):
++                ev = raw[6:].strip()
++            elif raw.startswith("data:"):
++                d = json.loads(raw[5:])
++                print(line(d) if ev == "status" else f"*** event: {d['type']}", flush=True)
++    elif a.cmd == "start":
++        body = {"pot": a.pot, "frozen": a.frozen, "confirm_water": a.water_ok, "auto_start": a.auto_start}
++        if a.manual:
++            body["manual"] = {"temp_c": a.manual[0], "time_min": a.manual[1]}
++            if a.liters:
++                body["manual"]["liters"] = a.liters
++        elif a.preset:
++            body["preset"] = a.preset
++        else:
++            sys.exit("give a preset name/id or --manual TEMP MINUTES")
++        print(line(req("POST", "/cook", body)["status"]))
++    elif a.cmd == "act":
++        print(line(req("POST", f"/cook/actions/{a.action}")["status"]))
++    elif a.cmd == "log":
++        since, new = -1.0, not os.path.exists(a.file)
++        with open(a.file, "a", buffering=1) as f:
++            if new:
++                f.write("t_s,timestamp,temp_c\n")
++            try:
++                while True:
++                    try:
++                        h = urllib.request.urlopen(urllib.request.Request(
++                            f"{BASE}/history?format=csv&since={since}",
++                            headers={"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}), timeout=15)
++                    except urllib.error.HTTPError as e:
++                        if e.code == 404:
++                            print("cook ended; log closed"); break
++                        raise
++                    rows = h.read().decode().splitlines()[1:]
++                    for r in rows:
++                        f.write(r + "\n")
++                        since = float(r.split(",")[0])
++                    time.sleep(5)
++            except KeyboardInterrupt:
++                pass
++    elif a.cmd == "settings":
++        print(json.dumps(req("GET", "/settings"), indent=2, ensure_ascii=False))
++    elif a.cmd == "set":
++        print(json.dumps(req("PATCH", "/settings", kv(a.pairs)), indent=2, ensure_ascii=False))
++    elif a.cmd == "preset":
++        r = req("PATCH", f"/presets/{a.id}", kv(a.pairs)) if a.pairs else req("GET", f"/presets/{a.id}")
++        print(json.dumps(r, indent=2, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()

@@ -1,0 +1,473 @@
+openapi: 3.0.3
+info:
+  title: Sous Vide Assistant API
+  version: "1.0"
+  description: |
+    Scripting API for the Sous Vide Assistant (Anova Precision Cooker Nano).
+    Temperatures are degrees C, durations are seconds (`*_s`), except preset/manual
+    cook times which are minutes (`*_min`). Full prose documentation: docs/API.md.
+servers:
+  - url: http://127.0.0.1:8080/api/v1
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+  - {}
+tags:
+  - name: Telemetry
+  - name: Cook control
+  - name: Settings
+  - name: Simulator
+paths:
+  /health:
+    get:
+      tags: [Telemetry]
+      summary: Liveness check (never needs a token)
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  api_version: {type: string}
+                  simulator: {type: boolean}
+                  auth_required: {type: boolean}
+  /status:
+    get:
+      tags: [Telemetry]
+      summary: Connection, water temperature and full cook state
+      responses:
+        "200": {description: Current status, content: {application/json: {schema: {$ref: "#/components/schemas/Status"}}}}
+        "401": {$ref: "#/components/responses/Error"}
+  /stream:
+    get:
+      tags: [Telemetry]
+      summary: Server-Sent Events - `status` snapshots and `cook_event` chimes
+      parameters:
+        - {name: interval, in: query, schema: {type: number, default: 1, minimum: 0.25, maximum: 30}, description: Seconds between `status` events}
+      responses:
+        "200":
+          description: |
+            text/event-stream. Event `status` carries a Status object; event `cook_event`
+            carries an Event object (SSE `id:` = event id).
+          content:
+            text/event-stream:
+              schema: {type: string}
+  /events:
+    get:
+      tags: [Telemetry]
+      summary: Recent chime events (ring buffer of 30)
+      parameters:
+        - {name: after, in: query, schema: {type: integer, default: 0}, description: Only events with a higher id}
+      responses:
+        "200":
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events: {type: array, items: {$ref: "#/components/schemas/Event"}}
+                  last_event_id: {type: integer}
+        "400": {$ref: "#/components/responses/Error"}
+  /history:
+    get:
+      tags: [Telemetry]
+      summary: Temperature log and phase markers of the current session
+      parameters:
+        - {name: since, in: query, schema: {type: number, default: -1}, description: Only samples with t_s greater than this}
+        - {name: max_points, in: query, schema: {type: integer, default: 0}, description: Down-sample to about this many points}
+        - {name: format, in: query, schema: {type: string, enum: [json, csv], default: json}}
+      responses:
+        "200":
+          description: History
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/History"}
+            text/csv:
+              schema: {type: string, example: "t_s,timestamp,temp_c\n947.1,2026-11-02T04:34:37.959Z,23.463\n"}
+        "404": {$ref: "#/components/responses/Error"}
+  /cook:
+    get:
+      tags: [Cook control]
+      summary: Current cook (or null)
+      responses:
+        "200":
+          description: Cook
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cook: {nullable: true, allOf: [{$ref: "#/components/schemas/Cook"}]}
+    post:
+      tags: [Cook control]
+      summary: Start a cook (preset or manual)
+      description: |
+        Provide exactly one of `preset` or `manual`. `auto_start` requires `confirm_water`.
+        With `auto_start` the heater turns on without a person pressing anything.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StartCook"}
+            examples:
+              preset:
+                value: {preset: Chicken Breast, pot: small, frozen: false, confirm_water: true, auto_start: true}
+              manual:
+                value: {manual: {temp_c: 63, time_min: 45}, pot: medium, confirm_water: true}
+      responses:
+        "201":
+          description: Cook created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  status: {$ref: "#/components/schemas/Status"}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /cook/actions/{action}:
+    post:
+      tags: [Cook control]
+      summary: Perform a cook action
+      description: Check `cook.available_actions` in the status for what is allowed now.
+      parameters:
+        - name: action
+          in: path
+          required: true
+          schema: {$ref: "#/components/schemas/ActionName"}
+      responses:
+        "200":
+          description: Action performed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  action: {type: string}
+                  status: {$ref: "#/components/schemas/Status"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+  /settings:
+    get:
+      tags: [Settings]
+      summary: Full settings
+      responses:
+        "200": {description: Settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
+    put:
+      tags: [Settings]
+      summary: Replace settings (omitted fields reset to factory defaults)
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}
+      responses:
+        "200": {description: Stored settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+    patch:
+      tags: [Settings]
+      summary: Partial update (pots/foods entries are matched by id)
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/SettingsPatch"}}}
+      responses:
+        "200": {description: Stored settings, content: {application/json: {schema: {$ref: "#/components/schemas/Settings"}}}}
+        "400": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /presets:
+    get:
+      tags: [Settings]
+      summary: All 12 preset slots
+      responses:
+        "200":
+          description: Presets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  presets: {type: array, items: {$ref: "#/components/schemas/PresetView"}}
+  /presets/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string, example: f3}}
+    get:
+      tags: [Settings]
+      summary: One preset
+      responses:
+        "200": {description: Preset, content: {application/json: {schema: {$ref: "#/components/schemas/PresetView"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+    patch:
+      tags: [Settings]
+      summary: Partial update of one preset (set name "" to blank the slot)
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/PresetPatch"}}}
+      responses:
+        "200": {description: Updated preset, content: {application/json: {schema: {$ref: "#/components/schemas/PresetView"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /pots:
+    get:
+      tags: [Settings]
+      summary: The three pots
+      responses:
+        "200":
+          description: Pots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pots: {type: array, items: {$ref: "#/components/schemas/Pot"}}
+  /pots/{id}:
+    patch:
+      tags: [Settings]
+      summary: Partial update of one pot
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string, enum: [small, medium, large]}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: "#/components/schemas/PotPatch"}}}
+      responses:
+        "200": {description: Updated pot, content: {application/json: {schema: {$ref: "#/components/schemas/Pot"}}}}
+        "404": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /sim/{name}:
+    post:
+      tags: [Simulator]
+      summary: Simulator hook (404 unless the server runs with --sim)
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string, enum: [food, lowwater, refill, unplug]}}
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  sim_action: {type: string}
+        "404": {$ref: "#/components/responses/Error"}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+    apiKeyAuth: {type: apiKey, in: header, name: X-API-Key}
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+      required: [error]
+    ActionName:
+      type: string
+      enum: [water_ok, start, cooker_started, pause, resume, food_in, stop, cancel, dismiss]
+    Phase:
+      type: string
+      enum: [water, connect, armed, preheat, ready, cook, done, ended]
+    Event:
+      type: object
+      properties:
+        id: {type: integer}
+        type: {type: string, enum: [ready, cookstart, complete, lowwater, lost]}
+    Pot:
+      type: object
+      properties:
+        id: {type: string, enum: [small, medium, large]}
+        label: {type: string, maxLength: 12}
+        range: {type: string, maxLength: 16}
+        liters: {type: number, minimum: 0.5, maximum: 30}
+    PotPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        label: {type: string}
+        range: {type: string}
+        liters: {type: number}
+    PotLiters:
+      type: object
+      additionalProperties: false
+      properties:
+        small: {type: number, nullable: true}
+        medium: {type: number, nullable: true}
+        large: {type: number, nullable: true}
+    Preset:
+      type: object
+      properties:
+        id: {type: string, example: f1}
+        name: {type: string, maxLength: 24}
+        emoji: {type: string, maxLength: 8}
+        temp_c: {type: number, minimum: 20, maximum: 92}
+        time_min: {type: integer, minimum: 1, maximum: 4320}
+        frozen_extra_min: {type: integer, minimum: 0, maximum: 4320}
+        liters: {$ref: "#/components/schemas/PotLiters"}
+    PresetView:
+      allOf:
+        - $ref: "#/components/schemas/Preset"
+        - type: object
+          properties:
+            slot: {type: integer, minimum: 1, maximum: 12}
+            empty: {type: boolean}
+    PresetPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        name: {type: string}
+        emoji: {type: string}
+        temp_c: {type: number}
+        time_min: {type: number}
+        frozen_extra_min: {type: number}
+        liters: {$ref: "#/components/schemas/PotLiters"}
+    Settings:
+      type: object
+      properties:
+        pots: {type: array, items: {$ref: "#/components/schemas/Pot"}}
+        foods: {type: array, items: {$ref: "#/components/schemas/Preset"}}
+        power_w: {type: integer, minimum: 100, maximum: 3000}
+        efficiency: {type: number, minimum: 0.3, maximum: 1}
+        dip_threshold_c: {type: number, minimum: 0.3, maximum: 10}
+        ready_tol_c: {type: number, minimum: 0.05, maximum: 2}
+        ready_reminder_s: {type: integer, minimum: 0, maximum: 600}
+        unplug_end_s: {type: integer, minimum: 30, maximum: 1800}
+        detect_pause_from_motor: {type: boolean}
+        volume: {type: number, minimum: 0, maximum: 1}
+    SettingsPatch:
+      type: object
+      additionalProperties: false
+      properties:
+        pots: {type: array, items: {$ref: "#/components/schemas/PotPatch"}}
+        foods: {type: array, items: {$ref: "#/components/schemas/PresetPatch"}}
+        power_w: {type: number}
+        efficiency: {type: number}
+        dip_threshold_c: {type: number}
+        ready_tol_c: {type: number}
+        ready_reminder_s: {type: number}
+        unplug_end_s: {type: number}
+        detect_pause_from_motor: {type: boolean}
+        volume: {type: number}
+    StartCook:
+      type: object
+      additionalProperties: false
+      required: [pot]
+      properties:
+        pot: {type: string, description: "Pot id (small/medium/large) or its label, e.g. \"8 qt\""}
+        preset: {type: string, description: Preset id (f1..f12) or exact name}
+        frozen: {type: boolean, default: false}
+        manual:
+          type: object
+          additionalProperties: false
+          required: [temp_c, time_min]
+          properties:
+            temp_c: {type: number, minimum: 20, maximum: 92}
+            time_min: {type: number, minimum: 1, maximum: 4320}
+            liters: {type: number, minimum: 0.5, maximum: 30}
+        confirm_water: {type: boolean, default: false}
+        auto_start: {type: boolean, default: false, description: Requires confirm_water}
+    Preheat:
+      type: object
+      properties:
+        start_temp_c: {type: number}
+        eta_s: {type: number, nullable: true}
+        eta_source: {type: string, enum: [model, measured]}
+        progress: {type: number, minimum: 0, maximum: 1}
+        duration_s: {type: number}
+    Dip:
+      type: object
+      properties:
+        active: {type: boolean}
+        low_c: {type: number}
+        depth_c: {type: number}
+        recovery_s: {type: number}
+        low_after_s: {type: number}
+    Cook:
+      type: object
+      properties:
+        phase: {$ref: "#/components/schemas/Phase"}
+        paused: {type: boolean}
+        pause_source: {type: string, enum: [ui, cooker], nullable: true}
+        name: {type: string}
+        emoji: {type: string}
+        manual: {type: boolean}
+        frozen: {type: boolean}
+        pot:
+          type: object
+          properties:
+            id: {type: string}
+            label: {type: string}
+            range: {type: string}
+        liters: {type: number}
+        target_c: {type: number}
+        target_f: {type: number}
+        total_s: {type: number}
+        base_s: {type: number}
+        extra_s: {type: number}
+        elapsed_s: {type: number}
+        remaining_s: {type: number}
+        overtime_s: {type: number}
+        cooker_link_lost: {type: boolean}
+        end_reason: {type: string, nullable: true}
+        session_s: {type: number}
+        auto_start_pending: {type: boolean}
+        available_actions: {type: array, items: {$ref: "#/components/schemas/ActionName"}}
+        preheat: {nullable: true, allOf: [{$ref: "#/components/schemas/Preheat"}]}
+        dip: {nullable: true, allOf: [{$ref: "#/components/schemas/Dip"}]}
+    Status:
+      type: object
+      properties:
+        api_version: {type: string}
+        timestamp: {type: string, format: date-time}
+        simulator: {type: boolean}
+        sim_speed: {type: number}
+        connection:
+          type: object
+          properties:
+            state: {type: string, enum: [idle, scanning, reconnecting, connected]}
+            connected: {type: boolean}
+            message: {type: string, nullable: true}
+        cooker:
+          type: object
+          properties:
+            water_temp_c: {type: number, nullable: true}
+            water_temp_f: {type: number, nullable: true}
+            water_low: {type: boolean}
+            motor_speed: {type: number, nullable: true}
+            telemetry_age_s: {type: number, nullable: true}
+        last_event_id: {type: integer}
+        cook: {nullable: true, allOf: [{$ref: "#/components/schemas/Cook"}]}
+    History:
+      type: object
+      properties:
+        session_started_at: {type: string, format: date-time}
+        name: {type: string}
+        phase: {$ref: "#/components/schemas/Phase"}
+        columns: {type: array, items: {type: string}, example: [t_s, temp_c]}
+        samples:
+          type: array
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items: {type: number}
+        markers:
+          type: array
+          items:
+            type: object
+            properties:
+              t_s: {type: number}
+              kind: {type: string, enum: [armed, start, ready, food, recovered, done, end]}
+        next_since: {type: number}
